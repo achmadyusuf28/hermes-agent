@@ -4,6 +4,7 @@ All functions are stateless. AIAgent._build_system_prompt() calls these to
 assemble pieces, then combines them with memory and ephemeral prompts.
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -1059,6 +1060,14 @@ def _clear_backend_probe_cache() -> None:
     _BACKEND_PROBE_CACHE.clear()
 
 
+def _is_nixos() -> bool:
+    """Detect if running on NixOS by checking for the canonical marker."""
+    try:
+        return os.path.exists("/etc/NIXOS")
+    except Exception:
+        return False
+
+
 def build_environment_hints() -> str:
     """Return environment-specific guidance for the system prompt.
 
@@ -1093,6 +1102,8 @@ def build_environment_hints() -> str:
         elif sys.platform == "darwin":
             mac_ver = platform.mac_ver()[0]
             host_lines.append(f"Host: macOS ({mac_ver or platform.release()})")
+        elif _is_nixos():
+            host_lines.append(f"Host: NixOS ({platform.release()})")
         else:
             host_lines.append(f"Host: {platform.system()} ({platform.release()})")
 
@@ -1272,9 +1283,15 @@ def clear_skills_system_prompt_cache(*, clear_snapshot: bool = False) -> None:
             logger.debug("Could not remove skills prompt snapshot: %s", e)
 
 
-def _build_skills_manifest(skills_dir: Path) -> dict[str, list[int]]:
-    """Build an mtime/size manifest of all SKILL.md and DESCRIPTION.md files."""
-    manifest: dict[str, list[int]] = {}
+def _build_skills_manifest(skills_dir: Path) -> dict[str, list[int | str]]:
+    """Build an mtime/size manifest of all SKILL.md and DESCRIPTION.md files.
+
+    Uses a content-hash fallback for paths under ``/nix/store/`` (or any
+    file whose ``st_mtime_ns`` is 0, which includes Nix's frozen epoch) so
+    immutable store dirs don't invalidate the cache on every cold start.
+    """
+    _is_nix_store = "/nix/store/" in str(skills_dir)
+    manifest: dict[str, list[int | str]] = {}
     skills_dir_str = str(skills_dir)
     base = os.path.join(skills_dir_str, "")
     prefix_len = len(base)
@@ -1294,7 +1311,17 @@ def _build_skills_manifest(skills_dir: Path) -> dict[str, list[int]]:
                 st = os.stat(path)
             except OSError:
                 continue
-            manifest[path[prefix_len:]] = [st.st_mtime_ns, st.st_size]
+            if _is_nix_store or st.st_mtime_ns == 0:
+                # Nix store files have frozen mtime; hash content instead.
+                try:
+                    with open(path, "rb") as fh:
+                        data = fh.read()
+                    fingerprint = hashlib.sha256(data).hexdigest()[:16]
+                except OSError:
+                    continue
+                manifest[path[prefix_len:]] = [0, st.st_size, fingerprint]
+            else:
+                manifest[path[prefix_len:]] = [st.st_mtime_ns, st.st_size]
     return manifest
 
 
@@ -1318,7 +1345,7 @@ def _load_skills_snapshot(skills_dir: Path) -> Optional[dict]:
 
 def _write_skills_snapshot(
     skills_dir: Path,
-    manifest: dict[str, list[int]],
+    manifest: dict[str, list[int | str]],
     skill_entries: list[dict],
     category_descriptions: dict[str, str],
 ) -> None:

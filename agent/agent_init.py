@@ -1496,6 +1496,17 @@ def init_agent(
         _api_retries = 3
     agent._api_max_retries = _api_retries
 
+    # User-supplied prompt overrides — plain text blocks injected at named
+    # positions in the stable section of the system prompt.  Keys:
+    #   after_identity, before_hints, append_stable
+    # Empty/missing entries are ignored.  This is a dict (not a config
+    # section) so defaults are always {} and the for loop is safe.
+    _prompt_overrides = _agent_section.get("prompt_overrides", {})
+    if isinstance(_prompt_overrides, dict):
+        agent._prompt_overrides = _prompt_overrides
+    else:
+        agent._prompt_overrides = {}
+
     # Initialize context compressor for automatic context management
     # Compresses conversation when approaching model's context limit
     # Configuration via config.yaml (compression section)

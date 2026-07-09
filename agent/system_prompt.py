@@ -179,6 +179,14 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # ── Stable tier ────────────────────────────────────────────────
     stable_parts: List[str] = []
 
+    # Prompt schema version — a semantic stamp tied to the guidance-block
+    # structure, not to the Hermes package version.  Bump when major
+    # guidance blocks are added, removed, or restructured so downstream
+    # tools and the model can identify which prompt architecture built the
+    # current system prompt.  This single line is the first content in the
+    # system prompt — models see it on every turn.
+    stable_parts.append("Prompt schema: v1")
+
     # Try SOUL.md as primary identity unless the caller explicitly skipped it.
     # Some execution modes (cron) still want HERMES_HOME persona while keeping
     # cwd project instructions disabled.
@@ -192,6 +200,13 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     if not _soul_loaded:
         # Fallback to hardcoded identity
         stable_parts.append(DEFAULT_AGENT_IDENTITY)
+
+    # User-supplied override: injected right after the identity block.
+    _override_after_id = (
+        getattr(agent, "_prompt_overrides", None) or {}
+    ).get("after_identity", "").strip()
+    if _override_after_id:
+        stable_parts.append(_override_after_id)
 
     # Pointer to the hermes-agent skill + docs for user questions about Hermes itself.
     stable_parts.append(HERMES_AGENT_HELP_GUIDANCE)
@@ -335,6 +350,13 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             f"not on any model name returned by the API."
         )
 
+    # User-supplied override: injected right before environment hints.
+    _override_before_hints = (
+        getattr(agent, "_prompt_overrides", None) or {}
+    ).get("before_hints", "").strip()
+    if _override_before_hints:
+        stable_parts.append(_override_before_hints)
+
     # Environment hints (WSL, Termux, etc.) — tell the agent about the
     # execution environment so it can translate paths and adapt behavior.
     # Stable for the lifetime of the process.
@@ -434,6 +456,13 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         _effective_hint = _tui_embedded_pane_clarifier(_effective_hint)
     if _effective_hint:
         stable_parts.append(_effective_hint)
+
+    # User-supplied override: appended at the very end of the stable section.
+    _override_append_stable = (
+        getattr(agent, "_prompt_overrides", None) or {}
+    ).get("append_stable", "").strip()
+    if _override_append_stable:
+        stable_parts.append(_override_append_stable)
 
     # ── Context tier (cwd-dependent, may change between sessions) ─
     context_parts: List[str] = []

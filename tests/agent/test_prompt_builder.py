@@ -1156,6 +1156,7 @@ class TestEnvironmentHints:
         monkeypatch.setattr(sys, "platform", "linux")
         monkeypatch.setattr(platform, "system", lambda: "Linux")
         monkeypatch.setattr(platform, "release", lambda: "6.8.0-generic")
+        monkeypatch.setattr(_pb, "_is_nixos", lambda: False)
         monkeypatch.delenv("TERMINAL_ENV", raising=False)
         _pb._clear_backend_probe_cache()
         result = _pb.build_environment_hints()

@@ -2569,6 +2569,18 @@ DEFAULT_CONFIG = {
     #         table_formatting skill instead of emitting a Markdown table.
     "platform_hints": {},
 
+    # User-supplied guidance block overrides injected into the stable section
+    # of the system prompt.  Each entry is appended at the position indicated
+    # by its key, letting you add custom instructions without forking the
+    # package.  Supported keys:
+    #   after_identity    — right after the agent identity (SOUL.md or default)
+    #   before_hints      — before environment/platform hints
+    #   append_stable     — at the very end of the stable section (last word
+    #                       before context files and volatile content)
+    # Each value is a plain text block; empty or missing entries are ignored.
+    # Cache-safe: takes effect next session (system-prompt rebuild).
+    "prompt_overrides": {},
+
     # Shell-script hooks — declarative bridge that invokes shell scripts
     # on plugin-hook events (pre_tool_call, post_tool_call, pre_llm_call,
     # subagent_stop, etc.).  Each entry maps an event name to a list of
