@@ -139,3 +139,32 @@ Verdict options:
   delegate_task) should be a concise human-readable summary.
 - **If no TASK_DIR is set**, you're in normal (unstructured) delegation mode.
   Ignore this protocol and work as normal.
+
+### Fable Method patterns
+
+Added in v1.1.0 — inspired by the [Fable Method](https://github.com/Sahir619/fable-method):
+
+**Artifact lines.** Your final message **MUST** start with exactly one of:
+- `RESULT: <path>/_result.json` — task completed, result file written
+- `BLOCKED: <reason>` — unrecoverable blocker
+- `PENDING: <path>/_result.json — <action>` — completed but a follow-up needs authorization
+
+The parent uses these lines to parse your output automatically. A message without an artifact line is treated as incomplete.
+
+**TWINS check (optional but recommended).** If you find a bug or pattern in one file, search the whole project for the same pattern. Record in `_result.json`:
+```json
+"twin_check": {
+  "pattern": "the construct or expression you searched for",
+  "sites_found": ["file1.nix:42", "file2.nix:10"],
+  "action_taken": "listed"
+}
+```
+This prevents "fix one, miss three" — the most common investigation failure.
+
+**PENDING actions.** If your work completes but a prescribed follow-up needs user authorization (deploy, push, restart, send), record it in `_result.json`:
+```json
+"pending_action": "deploy to prod — awaiting your authorization"
+```
+This makes silent follow-up omissions visible.
+
+**Adversarial judge (parent-initiated).** After you write `_result.json`, the parent may spawn a judge subagent that reads your result and tries to refute each claim. The judge writes `_judge.json` with a VERIFIED / REFUTED verdict. This is normal — treat it as a quality gate, not a retraction.

@@ -11,7 +11,16 @@ Protocol flow:
   4. Parent writes  _correction.json(mid-flight course correction, optional)
   5. Worker writes  _result.json    (final deliverable)
 
-Directory:  ~/.hermes/workspace/<task_id>/
+Artifact lines (inspired by Fable Method):
+  - The worker's final summary MUST start with an artifact line
+  - RESULT:    task completed, _result.json written
+  - BLOCKED:   task hit a blocker
+  - PENDING:   task completed but a follow-up needs user authorization
+
+Fable Method patterns integrated:
+  - Artifact gates: forced lines in final summary (RESULT/BLOCKED/PENDING)
+  - TWINS check: cross-search for duplicate findings (optional in result)
+  - Adversarial judge: second pass that attempts to refute a result
 """
 
 from __future__ import annotations
@@ -20,7 +29,7 @@ import json
 import os
 import time
 from dataclasses import asdict, dataclass, field
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -34,6 +43,16 @@ PROGRESS_FILE = "_progress.jsonl"
 RESULT_FILE = "_result.json"
 CORRECTION_FILE = "_correction.json"
 STATE_FILE = "_state.json"
+JUDGE_FILE = "_judge.json"
+
+# Artifact line prefixes (inspired by Fable Method's INTENT/AUTH/TWINS/PENDING)
+# The subagent's final summary MUST start with one of these.
+ARTIFACT_RESULT = "RESULT:"
+"""Task completed successfully; _result.json was written."""
+ARTIFACT_BLOCKED = "BLOCKED:"
+"""Task hit an unrecoverable blocker."""
+ARTIFACT_PENDING = "PENDING:"
+"""Task completed but a follow-up action needs user authorization."""
 
 # ---------------------------------------------------------------------------
 # Types
@@ -55,6 +74,27 @@ class Evidence:
     detail: str = ""
     """Short excerpt, line reference, or description of what was found, 
     e.g. 'line 14: inputs.soup-nix.url = ...'."""
+
+
+@dataclass
+class TwinCheck:
+    """TWINS check record — inspired by Fable Method's twin check.
+
+    A bug or pattern found in one place must be searched for across the
+    whole project. This dataclass captures what was searched and what was
+    found.
+    """
+
+    pattern: str
+    """The exact pattern, construct, or expression that was searched for."""
+
+    sites_found: list[str]
+    """List of file paths (with line numbers) where the pattern was found,
+    or empty list if none."""
+
+    action_taken: str = "listed"
+    """What the worker did with the twin sites. One of: 'listed', 'fixed', 
+    'reported', 'none_needed'."""
 
 
 # ---------------------------------------------------------------------------
@@ -153,7 +193,12 @@ class Correction:
 
 @dataclass
 class DelegationResult:
-    """Structured result written by the worker on completion."""
+    """Structured result written by the worker on completion.
+
+    Includes Fable Method-inspired fields:
+    - `twin_check`: records cross-search for duplicate findings
+    - `pending_action`: records a follow-up that needs user authorization
+    """
 
     task_id: str
     """Must match the `task_id` from the brief."""
@@ -170,6 +215,14 @@ class DelegationResult:
     """Suggested next action, if any."""
     files_touched: Optional[list[str]] = None
     """Files the worker read or wrote."""
+
+    # Fable Method-inspired extensions
+    twin_check: Optional[TwinCheck] = None
+    """TWINS check — did the worker search for identical patterns elsewhere?"""
+    pending_action: Optional[str] = None
+    """PENDING action — a follow-up that needs user authorization before it
+    can be taken (e.g., deploy, push, restart, send). Corresponds to the
+    PENDING artifact line in the summary."""
 
 
 # ---------------------------------------------------------------------------
@@ -313,6 +366,14 @@ def read_result(task_dir: str) -> Optional[DelegationResult]:
     task_id = data.get("task_id", os.path.basename(os.path.dirname(path)))
     if "verdict" in data:
         ev_list = [Evidence(**e) for e in data["evidence"]]
+        twin = None
+        if "twin_check" in data and data["twin_check"]:
+            tc = data["twin_check"]
+            twin = TwinCheck(
+                pattern=tc["pattern"],
+                sites_found=tc["sites_found"],
+                action_taken=tc.get("action_taken", "listed"),
+            )
         return DelegationResult(
             task_id=task_id,
             verdict=data["verdict"],
@@ -321,6 +382,8 @@ def read_result(task_dir: str) -> Optional[DelegationResult]:
             remaining_uncertainty=data.get("remaining_uncertainty"),
             recommendation=data.get("recommendation"),
             files_touched=data.get("files_touched"),
+            twin_check=twin,
+            pending_action=data.get("pending_action"),
         )
     else:
         # Free-form: wrap the whole payload as one evidence entry
@@ -336,3 +399,105 @@ def read_result(task_dir: str) -> Optional[DelegationResult]:
             recommendation=data.get("conclusion", None),
             files_touched=[],
         )
+
+
+# ---------------------------------------------------------------------------
+# Artifact line helpers  (inspired by Fable Method)
+# ---------------------------------------------------------------------------
+
+
+def validate_artifact_line(summary_text: str) -> tuple[str, str]:
+    """Validate that a summary starts with a valid artifact line.
+
+    Returns (prefix, rest_of_summary). Raises ValueError if no artifact
+    line is found.
+    """
+    first_line = summary_text.strip().split("\n")[0]
+    for prefix in (ARTIFACT_RESULT, ARTIFACT_BLOCKED, ARTIFACT_PENDING):
+        if first_line.startswith(prefix):
+            return prefix, summary_text[len(prefix):].strip()
+    raise ValueError(
+        f"Summary must start with one of: "
+        f"{ARTIFACT_RESULT}, {ARTIFACT_BLOCKED}, or {ARTIFACT_PENDING}. "
+        f"First line was: {first_line[:100]!r}"
+    )
+
+
+def format_artifact_line(prefix: str, task_dir_path: str, extra: str = "") -> str:
+    """Format an artifact line for the subagent's final summary.
+
+    Args:
+        prefix: One of ARTIFACT_RESULT, ARTIFACT_BLOCKED, ARTIFACT_PENDING
+        task_dir_path: Path to the task directory
+        extra: Optional extra info (e.g. reason for BLOCKED, action for PENDING)
+
+    Returns:
+        The formatted artifact line, e.g.
+        "RESULT: /home/hermes/.hermes/workspace/debug-x/_result.json"
+        "BLOCKED: missing credentials"
+        "PENDING: deploy to prod — awaiting your authorization"
+    """
+    if prefix == ARTIFACT_RESULT:
+        return f"{prefix} {os.path.join(task_dir_path, RESULT_FILE)}"
+    elif prefix == ARTIFACT_BLOCKED:
+        return f"{prefix} {extra}" if extra else f"{prefix} unknown"
+    elif prefix == ARTIFACT_PENDING:
+        return f"{prefix} {extra} — awaiting your authorization" if extra else f"{prefix} unknown"
+    return f"{prefix} {task_dir_path}"
+
+
+# ---------------------------------------------------------------------------
+# Adversarial Judge  (inspired by Fable Method's fable-judge)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class JudgeReport:
+    """Report from an adversarial judge reviewing a completed task.
+
+    The judge reads the worker's _result.json and tries to refute the
+    findings. This catches verification theater: claims that sound right
+    but aren't actually true.
+    """
+
+    task_id: str
+    """Task being judged."""
+    verdict: Literal["VERIFIED", "VERIFIED_WITH_CAVEATS", "REFUTED"]
+    """Judge's overall verdict."""
+    claims_checked: int
+    """Number of claims in the original result that were checked."""
+    claims_refuted: int
+    """Number of claims that were successfully refuted."""
+    refutations: list[str]
+    """Specific refutations, one per refuted claim."""
+    caveats: list[str]
+    """Issues found that don't refute the work but should be noted."""
+    recommendation: Optional[str] = None
+    """What to do next if REFUTED or VERIFIED_WITH_CAVEATS."""
+
+
+def judge_result(task_dir: str) -> Optional[JudgeReport]:
+    """Read a judge report from disk, if one exists."""
+    path = os.path.join(task_dir, JUDGE_FILE)
+    if not os.path.exists(path):
+        return None
+    with open(path) as f:
+        data = json.load(f)
+    return JudgeReport(
+        task_id=data["task_id"],
+        verdict=data["verdict"],
+        claims_checked=data["claims_checked"],
+        claims_refuted=data["claims_refuted"],
+        refutations=data.get("refutations", []),
+        caveats=data.get("caveats", []),
+        recommendation=data.get("recommendation"),
+    )
+
+
+def write_judge_report(task_dir: str, report: JudgeReport) -> str:
+    """Write a judge report to disk. Returns the file path."""
+    _ensure_dir(task_dir)
+    path = os.path.join(task_dir, JUDGE_FILE)
+    with open(path, "w") as f:
+        json.dump(asdict(report), f, indent=2, default=str)
+    return path
