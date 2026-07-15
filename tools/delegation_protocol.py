@@ -501,3 +501,58 @@ def write_judge_report(task_dir: str, report: JudgeReport) -> str:
     with open(path, "w") as f:
         json.dump(asdict(report), f, indent=2, default=str)
     return path
+
+
+# ---------------------------------------------------------------------------
+# Adversarial Judge — convenience helpers  (inspired by Fable Method)
+# ---------------------------------------------------------------------------
+
+
+def judge_goal(task_dir: str) -> str:
+    """Generate the goal string for a judge subagent.
+
+    The judge reads the worker's _result.json and tries to refute every
+    claim. Use after the worker completes::
+
+        result = read_result(td)
+        if result:
+            delegate_task(
+                goal=judge_goal(td),
+                context=judge_context(td),
+            )
+
+    Returns:
+        Goal string for delegate_task.
+    """
+    result_path = os.path.join(task_dir, RESULT_FILE)
+    judge_path = os.path.join(task_dir, JUDGE_FILE)
+    return (
+        f"Read the result at {result_path} and try to refute EVERY claim in it.\n\n"
+        "You are an adversarial judge. Your stance is: a report is a set of claims, "
+        "not evidence. Nothing is believed that was not observed.\n\n"
+        "For each claim in the result:\n"
+        "  1. Re-run the verification (read the file, check the output)\n"
+        "  2. If it holds up, note it as VERIFIED\n"
+        "  3. If it\'s wrong, incomplete, or unverifiable, record it as REFUTED\n\n"
+        f"Write your verdict to {judge_path} with this structure:\n"
+        "  - verdict: VERIFIED | VERIFIED_WITH_CAVEATS | REFUTED\n"
+        "  - claims_checked: <int>\n"
+        "  - claims_refuted: <int>\n"
+        "  - refutations: [<string>, ...]\n"
+        "  - caveats: [<string>, ...]\n"
+        "  - recommendation: <string or null>\n\n"
+        "Be harsh but honest. A REFUTED verdict with evidence is more valuable "
+        "than a VERIFIED verdict with nothing checked."
+    )
+
+
+def judge_context(task_dir: str) -> str:
+    """Generate the context string for a judge subagent.
+
+    Args:
+        task_dir: The task directory path.
+
+    Returns:
+        Context string for delegate_task.
+    """
+    return f"TASK_DIR: {task_dir}\nRole: adversarial judge"
