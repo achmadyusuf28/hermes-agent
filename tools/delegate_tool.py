@@ -682,21 +682,99 @@ def _build_child_system_prompt(
     ]
     if context and context.strip():
         parts.append(f"\nCONTEXT:\n{context}")
+
+        # Structured delegation protocol: if context contains a TASK_DIR marker,
+        # inject protocol instructions for reading brief + writing progress + result.
+        task_dir_found = False
+        for line in context.strip().splitlines():
+            line = line.strip()
+            if line.startswith("TASK_DIR:"):
+                task_dir = line.split(":", 1)[1].strip()
+                task_dir_found = True  # flag for protocol-aware completion instructions
+                parts.append(
+                    "\n## Structured Delegation Protocol\n"
+                    "This task uses the Hermes Delegation Protocol. Follow these steps:\n\n"
+                    "### 1. Read the brief\n"
+                    f"Open `{task_dir}/_brief.json`. This file contains:\n"
+                    f"  - `task_id`: a unique semantic identifier for this work unit\n"
+                    f"  - `intent`: what the parent is trying to achieve (one line)\n"
+                    f"  - `acceptance`: what 'done' looks like\n"
+                    f"  - `environment.cwd`: the working directory to use\n"
+                    f"  - `open_questions` (optional): specific questions to answer\n"
+                    f"  - `hypothesis` (optional): what the parent suspects\n"
+                    f"  - `eliminated_paths` (optional): what has been ruled out\n"
+                    f"  - `constraints` (optional): guardrails to respect\n\n"
+                    "### 2. Work, writing progress as you go\n"
+                    "After each meaningful step (finding, dead end, shift of focus, "
+                    "or every ~5 tool calls), append a JSON line to "
+                    f"`{task_dir}/_progress.jsonl`. Each entry has:\n"
+                    "  - `ts`: unix timestamp\n"
+                    "  - `type`: one of `finding`, `dead_end`, `shift`, `checkpoint`, "
+                    "`blocked`, `correction_ack`, `error`\n"
+                    "  - `detail`: human-readable description\n"
+                    "  - `evidence`: optional array of `{\"path\": ..., \"detail\": ...}` "
+                    "for file-attributed proof\n\n"
+                    "### 3. Check for corrections (mid-flight)\n"
+                    "After each work step, check if "
+                    f"`{task_dir}/_correction.json` exists and has a `seq` "
+                    "higher than the last one you saw. If it does, read the correction "
+                    "and adjust your approach.\n\n"
+                    "### 4. Write the result\n"
+                    "When done (successfully or with a blocker), write "
+                    f"`{task_dir}/_result.json` with:\n"
+                    "  - `task_id`: must match the brief\n"
+                    "  - `verdict`: FOUND | NOT_FOUND | INCONCLUSIVE | BLOCKED\n"
+                    "  - `confidence`: 0.0 to 1.0\n"
+                    "  - `evidence`: array of `{\"path\": ..., \"detail\": ...}`\n"
+                    "  - `remaining_uncertainty` (optional): what's still unknown\n"
+                    "  - `recommendation` (optional): suggested next action\n"
+                    "  - `files_touched` (optional): files you read or wrote\n\n"
+                    "### Protocol rules\n"
+                    "  - Write progress at least every ~5 tool calls\n"
+                    "  - On unrecoverable error: write result with verdict BLOCKED\n"
+                    "  - Do NOT delete the workspace directory (that's the parent's job)\n"
+                    "  - The structured result supplements your summary — "
+                    "your final message to the parent is still expected\n"
+                )
     if workspace_path and str(workspace_path).strip():
         parts.append(
             "\nWORKSPACE PATH:\n"
             f"{workspace_path}\n"
             "Use this exact path for local repository/workdir operations unless the task explicitly says otherwise."
         )
+    if task_dir_found:
+        parts.append(
+            "\n### 5. Complete the task\n"
+            "You MUST follow these steps **in order** before sending your final summary:\n\n"
+            "**Step A — Verify the result file**\n"
+            f"Confirm `{task_dir}/_result.json` exists and has:\n"
+            "   - `task_id`: matching the brief\n"
+            "   - `verdict`: FOUND, NOT_FOUND, INCONCLUSIVE, or BLOCKED\n"
+            "   - `confidence`: 0.0 to 1.0\n"
+            "   - `evidence`: array of `{\\\"path\\\": ..., \\\"detail\\\": ...}`\n\n"
+            "**Step B — Your final message**\n"
+            "Your final message **MUST** start with exactly one of:\n"
+            f"   - `RESULT: {task_dir}/_result.json` (if you wrote one)\n"
+            "   - `BLOCKED: <reason>` (if you hit a blocker)\n\n"
+            "**Step C — Summary**\n"
+            "After that line, provide your normal summary of what you did, found, "
+            "and any issues encountered.\n\n"
+            "**If you did NOT write `_result.json`, your task is incomplete.**\n\n"
+        )
+    else:
+        parts.append(
+            "\nComplete this task using the tools available to you. "
+            "When finished, provide a clear, concise summary of:\n"
+            "- What you did\n"
+            "- What you found or accomplished\n"
+            "- Any files you created or modified\n"
+            "- Any issues encountered\n\n"
+            "Important workspace rule: Never assume a repository lives at /workspace/... "
+            "or any other container-style path unless the task/context explicitly gives "
+            "that path. If no exact local path is provided, discover it first before "
+            "issuing git/workdir-specific commands.\n\n"
+        )
     parts.append(
-        "\nComplete this task using the tools available to you. "
-        "When finished, provide a clear, concise summary of:\n"
-        "- What you did\n"
-        "- What you found or accomplished\n"
-        "- Any files you created or modified\n"
-        "- Any issues encountered\n\n"
-        "Important workspace rule: Never assume a repository lives at /workspace/... or any other container-style path unless the task/context explicitly gives that path. "
-        "If no exact local path is provided, discover it first before issuing git/workdir-specific commands.\n\n"
         "Keep your final summary tight: lead with outcomes, prefer bullet "
         "points over paragraphs, and don't replay your whole process. Your "
         "response is returned to the parent agent as a summary, and overlong "
