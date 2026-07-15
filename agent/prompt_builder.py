@@ -184,7 +184,15 @@ SKILLS_GUIDANCE = (
     "skill with skill_manage so you can reuse it next time.\n"
     "When using a skill and finding it outdated, incomplete, or wrong, "
     "patch it immediately with skill_manage(action='patch') — don't wait to be asked. "
-    "Skills that aren't maintained become liabilities."
+    "Skills that aren't maintained become liabilities.\n"
+    "Before saving a NEW skill, run a pre-save quality gate:\n"
+    "  1. Triggers — does the skill list explicit \"When to Use\" trigger patterns?\n"
+    "  2. Verification — does it have at least one checkable completion criterion?\n"
+    "  3. Fallback — what happens if the main path fails? Is it documented?\n"
+    "  4. Freshness — do all referenced paths, commands, and API endpoints exist right now?\n"
+    "  5. Self-contained — does it assume knowledge not in the skill itself?\n"
+    "  6. Compact — does every sentence change behavior vs. the default? No-ops removed?\n"
+    "Each missing point is a liability. Fix before saving."
 )
 
 KANBAN_GUIDANCE = (
