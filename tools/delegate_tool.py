@@ -658,10 +658,104 @@ def check_delegate_requirements() -> bool:
     return True
 
 
+# --- KV-Cache-Stable Protocol Core -------------------------------------------
+# Byte-stable prefix shared by EVERY TASK_DIR subagent.  Built at module load.
+# ``{TASK_DIR}`` is a literal placeholder replaced via .replace() at prompt-build
+# time so the function is trivially cache-friendly.
+PROTOCOL_CORE = f"""You are a focused subagent working on a specific delegated task.
+Task workspace: {TASK_DIR}
+
+## Structured Delegation Protocol
+This task uses the Hermes Delegation Protocol. Follow these steps:
+
+### 1. Read the brief
+Open `{TASK_DIR}/_brief.json`. This file contains:
+  - `task_id`: a unique semantic identifier for this work unit
+  - `intent`: what the parent is trying to achieve (one line)
+  - `acceptance`: what 'done' looks like
+  - `environment.cwd`: the working directory to use
+  - `open_questions` (optional): specific questions to answer
+  - `hypothesis` (optional): what the parent suspects
+  - `eliminated_paths` (optional): what has been ruled out
+  - `constraints` (optional): guardrails to respect
+
+### 2. Work, writing progress as you go
+After each meaningful step (finding, dead end, shift of focus,
+or every ~5 tool calls), append a JSON line to
+`{TASK_DIR}/_progress.jsonl`. Each entry has:
+  - `ts`: unix timestamp
+  - `type`: one of `finding`, `dead_end`, `shift`, `checkpoint`,
+    `blocked`, `correction_ack`, `error`
+  - `detail`: human-readable description
+  - `evidence`: optional array of `{"path": ..., "detail": ...}`
+    for file-attributed proof
+
+### 3. Check for corrections (mid-flight)
+After each work step, check if
+`{TASK_DIR}/_correction.json` exists and has a `seq`
+higher than the last one you saw. If it does, read the correction
+and adjust your approach.
+
+### 4. Write the result
+When done (successfully or with a blocker), write
+`{TASK_DIR}/_result.json` with:
+  - `task_id`: must match the brief
+  - `verdict`: FOUND | NOT_FOUND | INCONCLUSIVE | BLOCKED
+  - `confidence`: 0.0 to 1.0
+  - `evidence`: array of `{"path": ..., "detail": ...}`
+  - `remaining_uncertainty` (optional): what is still unknown
+  - `recommendation` (optional): suggested next action
+  - `files_touched` (optional): files you read or wrote
+  - `twin_check` (optional): TWINS cross-search for findings. If you
+    found a pattern/bug in one file, search the whole project for
+    the same pattern. Record as `{"pattern": "...",
+    "sites_found": ["file:line", ...],
+    "action_taken": "listed"}`
+  - `pending_action` (optional): a follow-up that needs user
+    authorization (deploy, push, restart). Leave blank if none.
+
+### Protocol rules
+  - Write progress at least every ~5 tool calls
+  - **TWINS check**: if you found a defect, bug, or wrong construct
+    in one location, search the whole project for the same pattern.
+    Include `twin_check` in `_result.json`.
+  - On unrecoverable error: write result with verdict BLOCKED
+  - Do NOT delete the workspace directory (that is the parent job)
+  - The structured result supplements your summary --
+    your final message to the parent is still expected
+
+### 5. Complete the task
+You MUST follow these steps **in order** before sending your final
+summary:
+
+**Step A -- Verify the result file**
+Confirm the result file exists and has:
+  - `task_id`: matching the brief
+  - `verdict`: FOUND, NOT_FOUND, INCONCLUSIVE, or BLOCKED
+  - `confidence`: 0.0 to 1.0
+  - `evidence`: array of `{"path": ..., "detail": ...}`
+
+**Step B -- Your final message**
+Your final message **MUST** start with exactly one of:
+  - `RESULT: {TASK_DIR}/_result.json`
+    (if you wrote one)
+  - `BLOCKED: <reason>`
+    (if you hit a blocker)
+  - `PENDING: {TASK_DIR}/_result.json -- <action>`
+    (if work is complete but a follow-up needs your
+    authorization: deploy, push, restart, send)
+
+**Step C -- Summary**
+After that line, provide your normal summary of what you did, found,
+and any issues encountered.
+
+**If you did NOT write `{TASK_DIR}/_result.json`, your task is incomplete.**"""
+
 def _build_child_system_prompt(
     goal: str,
     context: Optional[str] = None,
     *,
+    task_dir: Optional[str] = None,
     workspace_path: Optional[str] = None,
     role: str = "leaf",
     max_spawn_depth: int = 2,
@@ -669,134 +763,52 @@ def _build_child_system_prompt(
 ) -> str:
     """Build a focused system prompt for a child agent.
 
+    KV-cache-aware design (Phase 0+):
+      - When ``task_dir`` is set, the prompt starts with the byte-stable
+        ``PROTOCOL_CORE`` constant (``{TASK_DIR}`` replaced once), then
+        appends the variable tail (goal, context, workspace).
+      - When ``task_dir`` is None, a minimal core is used instead.
+
+    This means N parallel subagents sharing the same task_dir get an ~90%
+    KV-cache hit rate on the shared prefix.
+
     When role='orchestrator', appends a delegation-capability block
     modeled on OpenClaw's buildSubagentSystemPrompt (canSpawn branch at
     inspiration/openclaw/src/agents/subagent-system-prompt.ts:63-95).
     The depth note is literal truth (grounded in the passed config) so
-    the LLM doesn't confabulate nesting capabilities that don't exist.
+    the LLM doesn't confabulate nesting capabilities that do not exist.
     """
-    parts = [
-        "You are a focused subagent working on a specific delegated task.",
-        "",
-        f"YOUR TASK:\n{goal}",
-    ]
-    if context and context.strip():
-        parts.append(f"\nCONTEXT:\n{context}")
+    # --- Stable core ---
+    if task_dir:
+        prompt = PROTOCOL_CORE.replace("{TASK_DIR}", task_dir)
+    else:
+        prompt = "You are a focused subagent working on a specific delegated task."
 
-        # Structured delegation protocol: if context contains a TASK_DIR marker,
-        # inject protocol instructions for reading brief + writing progress + result.
-        task_dir_found = False
-        for line in context.strip().splitlines():
-            line = line.strip()
-            if line.startswith("TASK_DIR:"):
-                task_dir = line.split(":", 1)[1].strip()
-                task_dir_found = True  # flag for protocol-aware completion instructions
-                parts.append(
-                    "\n## Structured Delegation Protocol\n"
-                    "This task uses the Hermes Delegation Protocol. Follow these steps:\n\n"
-                    "### 1. Read the brief\n"
-                    f"Open `{task_dir}/_brief.json`. This file contains:\n"
-                    f"  - `task_id`: a unique semantic identifier for this work unit\n"
-                    f"  - `intent`: what the parent is trying to achieve (one line)\n"
-                    f"  - `acceptance`: what 'done' looks like\n"
-                    f"  - `environment.cwd`: the working directory to use\n"
-                    f"  - `open_questions` (optional): specific questions to answer\n"
-                    f"  - `hypothesis` (optional): what the parent suspects\n"
-                    f"  - `eliminated_paths` (optional): what has been ruled out\n"
-                    f"  - `constraints` (optional): guardrails to respect\n\n"
-                    "### 2. Work, writing progress as you go\n"
-                    "After each meaningful step (finding, dead end, shift of focus, "
-                    "or every ~5 tool calls), append a JSON line to "
-                    f"`{task_dir}/_progress.jsonl`. Each entry has:\n"
-                    "  - `ts`: unix timestamp\n"
-                    "  - `type`: one of `finding`, `dead_end`, `shift`, `checkpoint`, "
-                    "`blocked`, `correction_ack`, `error`\n"
-                    "  - `detail`: human-readable description\n"
-                    "  - `evidence`: optional array of `{\"path\": ..., \"detail\": ...}` "
-                    "for file-attributed proof\n\n"
-                    "### 3. Check for corrections (mid-flight)\n"
-                    "After each work step, check if "
-                    f"`{task_dir}/_correction.json` exists and has a `seq` "
-                    "higher than the last one you saw. If it does, read the correction "
-                    "and adjust your approach.\n\n"
-                    "### 4. Write the result\n"
-                    "When done (successfully or with a blocker), write "
-                    f"`{task_dir}/_result.json` with:\n"
-                    "  - `task_id`: must match the brief\n"
-                    "  - `verdict`: FOUND | NOT_FOUND | INCONCLUSIVE | BLOCKED\n"
-                    "  - `confidence`: 0.0 to 1.0\n"
-                    "  - `evidence`: array of `{\"path\": ..., \"detail\": ...}`\n"
-                    "  - `remaining_uncertainty` (optional): what's still unknown\n"
-                    "  - `recommendation` (optional): suggested next action\n"
-                    "  - `files_touched` (optional): files you read or wrote\n"
-                    "  - `twin_check` (optional): TWINS cross-search for findings. If you\n"
-                    "    found a pattern/bug in one file, search the whole project for\n"
-                    "    the same pattern. Record as `{\"pattern\": \"...\",\n"
-                    "    \"sites_found\": [\"file:line\", ...],\n"
-                    "    \"action_taken\": \"listed\"}`\n"
-                    "  - `pending_action` (optional): a follow-up that needs user\n"
-                    "    authorization (deploy, push, restart). Leave blank if none.\n\n"
-                    "### Protocol rules\n"
-                    "  - Write progress at least every ~5 tool calls\n"
-                    "  - **TWINS check**: if you found a defect, bug, or wrong construct in\n"
-                    "    one location, search the whole project for the same pattern.\n"
-                    "    Include `twin_check` in `_result.json`.\n"
-                    "  - On unrecoverable error: write result with verdict BLOCKED\n"
-                    "  - Do NOT delete the workspace directory (that's the parent's job)\n"
-                    "  - The structured result supplements your summary — "
-                    "your final message to the parent is still expected\n"
-                )
+    # --- Variable tail (everything past here differs per subagent) ---
+    parts = [prompt]
+    parts.append(f"\n## YOUR TASK\n{goal}")
+
+    if context and context.strip():
+        # Strip the TASK_DIR line from context display (already parsed)
+        cleaned = "\n".join(
+            line for line in context.strip().splitlines()
+            if not line.strip().startswith("TASK_DIR:")
+        )
+        if cleaned.strip():
+            parts.append(f"\n## CONTEXT\n{cleaned}")
+
     if workspace_path and str(workspace_path).strip():
         parts.append(
             "\nWORKSPACE PATH:\n"
             f"{workspace_path}\n"
-            "Use this exact path for local repository/workdir operations unless the task explicitly says otherwise."
+            "Use this exact path for local repository/workdir operations "
+            "unless the task explicitly says otherwise."
         )
-    if task_dir_found:
-        parts.append(
-            "\n### 5. Complete the task\n"
-            "You MUST follow these steps **in order** before sending your final summary:\n\n"
-            "**Step A — Verify the result file**\n"
-            "Confirm `{task_dir}/_result.json` exists and has:\n"
-            "   - `task_id`: matching the brief\n"
-            "   - `verdict`: FOUND, NOT_FOUND, INCONCLUSIVE, or BLOCKED\n"
-            "   - `confidence`: 0.0 to 1.0\n"
-            "   - `evidence`: array of `{\"path\": ..., \"detail\": ...}`\n\n"
-            "**Step B — Your final message**\n"
-            "Your final message **MUST** start with exactly one of:\n"
-            "   - `RESULT: {task_dir}/_result.json` (if you wrote one)\n"
-            "   - `BLOCKED: <reason>` (if you hit a blocker)\n"
-            "   - `PENDING: {task_dir}/_result.json — <action>`\n"
-            "     (if work is complete but a follow-up needs your\n"
-            "      authorization: deploy, push, restart, send)\n\n"
-            "**Step C — Summary**\n"
-            "After that line, provide your normal summary of what you did, found, "
-            "and any issues encountered.\n\n"
-            "**If you did NOT write `_result.json`, your task is incomplete.**\n\n"
-        )
-    else:
-        parts.append(
-            "\nComplete this task using the tools available to you. "
-            "When finished, provide a clear, concise summary of:\n"
-            "- What you did\n"
-            "- What you found or accomplished\n"
-            "- Any files you created or modified\n"
-            "- Any issues encountered\n\n"
-            "Important workspace rule: Never assume a repository lives at /workspace/... "
-            "or any other container-style path unless the task/context explicitly gives "
-            "that path. If no exact local path is provided, discover it first before "
-            "issuing git/workdir-specific commands.\n\n"
-        )
-    parts.append(
-        "Keep your final summary tight: lead with outcomes, prefer bullet "
-        "points over paragraphs, and don't replay your whole process. Your "
-        "response is returned to the parent agent as a summary, and overlong "
-        "summaries crowd out the parent's context window."
-    )
+
     if role == "orchestrator":
         child_note = (
             "Your own children MUST be leaves (cannot delegate further) "
-            "because they would be at the depth floor — you cannot pass "
+            "because they would be at the depth floor -- you cannot pass "
             "role='orchestrator' to your own delegate_task calls."
             if child_depth + 1 >= max_spawn_depth
             else "Your own children can themselves be orchestrators or leaves, "
@@ -814,18 +826,18 @@ def _build_child_system_prompt(
             "- A subtask is reasoning-heavy and would flood your context "
             "with intermediate data.\n\n"
             "WHEN NOT to delegate:\n"
-            "- Single-step mechanical work — do it directly.\n"
+            "- Single-step mechanical work -- do it directly.\n"
             "- Trivial tasks you can execute in one or two tool calls.\n"
             "- Re-delegating your entire assigned goal to one worker "
-            "(that's just pass-through with no value added).\n\n"
+            "(that is just pass-through with no value added).\n\n"
             "Coordinate your workers' results and synthesize them before "
             "reporting back to your parent. You are responsible for the "
             "final summary, not your workers.\n\n"
             f"NOTE: You are at depth {child_depth}. The delegation tree "
             f"is capped at max_spawn_depth={max_spawn_depth}. {child_note}"
         )
-    return "\n".join(parts)
 
+    return "\n".join(parts)
 
 def _resolve_workspace_hint(parent_agent) -> Optional[str]:
     """Best-effort local workspace hint for child prompts.
@@ -1233,9 +1245,17 @@ def _build_child_agent(
         child_toolsets.append("delegation")
 
     workspace_hint = _resolve_workspace_hint(parent_agent)
+    # Extract TASK_DIR from context for cache-stable protocol core
+    task_dir = None
+    if context and context.strip():
+        for line in context.strip().splitlines():
+            if line.strip().startswith("TASK_DIR:"):
+                task_dir = line.split(":", 1)[1].strip()
+                break
     child_prompt = _build_child_system_prompt(
         goal,
         context,
+        task_dir=task_dir,
         workspace_path=workspace_hint,
         role=effective_role,
         max_spawn_depth=max_spawn,

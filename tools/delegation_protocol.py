@@ -245,12 +245,23 @@ def task_dir(task_id: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+def canonical_json(obj: Any) -> str:
+    """Canonical JSON serialization for KV-cache stability.
+
+    Uses sort_keys=True and compact separators so the same data
+    always produces byte-identical output.  Subagents that copy
+    the protocol examples get an instant KV-cache hit on the
+    system prompt prefix.
+    """
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), default=str)
+
+
 def write_brief(task_dir: str, brief: DelegationBrief) -> str:
     """Write a brief to disk. Returns the file path."""
     _ensure_dir(task_dir)
     path = os.path.join(task_dir, BRIEF_FILE)
     with open(path, "w") as f:
-        json.dump(asdict(brief), f, indent=2, default=str)
+        f.write(canonical_json(asdict(brief)))
     return path
 
 
@@ -282,7 +293,7 @@ def append_progress(task_dir: str, entry: ProgressEntry) -> str:
     _ensure_dir(task_dir)
     path = os.path.join(task_dir, PROGRESS_FILE)
     with open(path, "a") as f:
-        f.write(json.dumps(asdict(entry), default=str) + "\n")
+        f.write(canonical_json(asdict(entry)) + "\n")
     return path
 
 
@@ -323,7 +334,7 @@ def write_correction(task_dir: str, correction: Correction) -> str:
     _ensure_dir(task_dir)
     path = os.path.join(task_dir, CORRECTION_FILE)
     with open(path, "w") as f:
-        json.dump(asdict(correction), f, indent=2, default=str)
+        f.write(canonical_json(asdict(correction)))
     return path
 
 
@@ -351,7 +362,7 @@ def write_result(task_dir: str, result: DelegationResult) -> str:
     _ensure_dir(task_dir)
     path = os.path.join(task_dir, RESULT_FILE)
     with open(path, "w") as f:
-        json.dump(asdict(result), f, indent=2, default=str)
+        f.write(canonical_json(asdict(result)))
     return path
 
 
@@ -499,7 +510,7 @@ def write_judge_report(task_dir: str, report: JudgeReport) -> str:
     _ensure_dir(task_dir)
     path = os.path.join(task_dir, JUDGE_FILE)
     with open(path, "w") as f:
-        json.dump(asdict(report), f, indent=2, default=str)
+        f.write(canonical_json(asdict(report)))
     return path
 
 
