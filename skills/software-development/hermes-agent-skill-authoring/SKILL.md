@@ -61,28 +61,67 @@ metadata:
 - Full SKILL.md: ≤ 100,000 chars (enforced as `MAX_SKILL_CONTENT_CHARS`, ~36k tokens).
 - Peer skills in `software-development/` sit at **8-14k chars**. Aim for that range. If you're pushing past 20k, split into `references/*.md` and reference them from SKILL.md.
 
-## Writing Quality Principles
+## Pre-Save Quality Gate
 
-A skill exists to make the agent's process more predictable. Predictability does **not** mean identical output every run; it means the agent reliably follows the same useful discipline.
+Before saving ANY skill — whether in-repo or user-local — run this gate:
 
-Use these quality checks when writing or editing any skill:
+### The Six Checks
 
-1. **Optimize for process predictability.** Ask: what behavior should change when this skill loads? If a line does not change behavior, cut it.
-2. **Choose the right context load.** A model-invoked Hermes skill pays for its description every turn. Keep descriptions focused on trigger classes and the skill's distinctive behavior. Put details in the body or linked references.
-3. **Use an information hierarchy.** Put always-needed steps in `SKILL.md`; put branch-specific or bulky reference material in `references/`, `templates/`, or `scripts/` and point to it only when needed.
-4. **End steps with completion criteria.** Each ordered step should say how the agent knows it is done. Good criteria are checkable and, when it matters, exhaustive: "every modified file accounted for" beats "summarize changes."
-5. **Co-locate rules with the concept they govern.** Avoid scattering one idea across the file. Keep definition, caveats, examples, and verification near each other.
-6. **Use strong leading words.** Prefer compact concepts the model already knows — e.g. "tight loop," "tracer bullet," "root cause," "regression test" — over long repeated explanations. A good leading word saves tokens and anchors behavior.
-7. **Prune duplication and no-ops.** Keep each meaning in one source of truth. Sentence by sentence, ask whether the sentence changes agent behavior versus the default. If not, delete it rather than polishing it.
-8. **Watch for premature completion.** If agents tend to rush a step, first sharpen that step's completion criterion. Split the sequence only when later steps distract from doing the current step well.
+1. **Triggers** — Does it have an explicit "When to Use" section listing trigger patterns? If I loaded this skill, would I know when I should and shouldn't use it?
 
-Common quality failures:
+2. **Verification** — Does it have at least one checkable completion criterion? A step that says "you're done when X" rather than just "do X."
 
-- **Premature completion** — the skill lets the agent move on before the work is genuinely done.
-- **Duplication** — the same rule appears in multiple places and drifts.
-- **Sediment** — stale lines remain because adding felt safer than deleting.
-- **Sprawl** — too much always-visible material; push branch-specific reference behind pointers.
-- **No-op prose** — generic advice the agent would already follow without the skill.
+3. **Fallback** — What happens if the main path fails? No results? Blocked? Permission denied? Is there an alternate path or a clear "signal and stop" documented?
+
+4. **Freshness** — Do all referenced paths, commands, API endpoints, and environment variables exist right now? This means actually checking — `os.path.exists()`, `curl -s`, `which`, etc. — not guessing.
+
+5. **Self-contained** — Does it assume knowledge that isn't in the skill itself? If it references another skill, that's fine if `related_skills` points to it. If it assumes the reader knows an obscure config path, that's a gap.
+
+6. **Compact** — Does every sentence change behavior vs. the default? A skill exists to *change* what the agent does. Lines that restate defaults, add "be careful" warnings without specifying what to check, or repeat info from other skills are no-ops. Delete them.
+
+### Example: Gate Applied
+
+Before:
+```markdown
+## Steps
+1. Check config.yaml
+2. Restart the service
+3. Done
+```
+
+After:
+```markdown
+## When to Use
+- User says "the service isn't running"
+- A restart was requested
+
+## Steps
+1. **Check** /home/hermes/.hermes/config.yaml for the `service.port` setting
+2. Verify the port is free: `ss -tlnp | grep <port>`
+3. Restart via `systemctl --user restart <service>`
+4. **Verify:** `systemctl --user status <service>` shows `active (running)`
+
+## Fallback
+If the port is in use by another process, log it and BLOCKED — don't kill processes without asking.
+
+## Common Pitfalls
+- config.yaml may not exist on first run — check `config = {}` case
+```
+
+### When to Skip the Gate
+
+- **Trivial update** — fixing a typo or updating a version string (use `patch`)
+- **Housekeeping** — removing a stale reference
+- **Deletion** — you're removing a skill, not creating one
+
+### Integration
+
+The gate is also encoded in the system prompt (`SKILLS_GUIDANCE` in `agent/prompt_builder.py`) so it fires every session. This skill is the full documentation — refer here for examples and rationale.
+
+## Related Skills
+
+- `post-task-reflection` — runs this gate implicitly by checking for missing sections after complex tasks
+- `hermes-cron-automation` → `references/tool-radar-quality-scan.md` — periodic audit scans for gate compliance
 
 ## Peer-Matched Structure
 
