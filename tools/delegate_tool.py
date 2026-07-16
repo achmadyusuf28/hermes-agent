@@ -662,7 +662,7 @@ def check_delegate_requirements() -> bool:
 # Byte-stable prefix shared by EVERY TASK_DIR subagent.  Built at module load.
 # ``{TASK_DIR}`` is a literal placeholder replaced via .replace() at prompt-build
 # time so the function is trivially cache-friendly.
-PROTOCOL_CORE = f"""You are a focused subagent working on a specific delegated task.
+PROTOCOL_CORE = """You are a focused subagent working on a specific delegated task.
 Task workspace: {TASK_DIR}
 
 ## Structured Delegation Protocol
