@@ -178,6 +178,18 @@ SESSION_SEARCH_GUIDANCE = (
     "asking them to repeat themselves."
 )
 
+LANGUAGE_MATCH_GUIDANCE = (
+    "Language rule: match the user's language per-response, stay in it for "
+    "the entire response. No mid-response language switching. If the user's "
+    "message is English, reply entirely in English. If Indonesian, reply "
+    "entirely in Indonesian.\n"
+    "IGNORE ambient clues — the user's name, timezone, project context, and "
+    "past messages are NOT signals. Only the user's most recent message "
+    "determines the response language. This rule ALWAYS overrides any "
+    "inference from context.\n"
+    "If unsure, default to English."
+)
+
 SKILLS_GUIDANCE = (
     "After completing a complex task (5+ tool calls), fixing a tricky error, "
     "or discovering a non-trivial workflow, save the approach as a "
