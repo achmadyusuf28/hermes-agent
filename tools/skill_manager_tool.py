@@ -575,6 +575,98 @@ def _validate_content_size(content: str, label: str = "SKILL.md") -> Optional[st
     return None
 
 
+def _validate_quality(content: str, name: str) -> list[str]:
+    """Soft quality-gate: check skill content against the 6-point quality
+    standard.  Returns a list of warning strings (may be empty); does NOT
+    block creation — the agent gets the warnings attached to the result so it
+    can self-correct.
+
+    Checks performed:
+      1. Triggers — ``triggers`` frontmatter array OR ``## When to Use`` section
+      2. Verification — ``## Verification`` or ``## Verification Checklist`` section
+      3. Fallback — ``## Common Pitfalls`` or ``## Pitfalls`` section
+      4. Self-contained — ``related_skills`` frontmatter OR ``## Prerequisites`` section
+      5. Compact — body under ~20 KB (proxy for no-op trimming)
+      6. Description — ≤ 200 chars and trigger-oriented
+
+    Freshness (check 4) is deliberately excluded — it requires runtime I/O
+    that cannot be evaluated at creation time without network/filesystem calls.
+    """
+    import re as _re
+
+    warnings: list[str] = []
+    body = content
+
+    # Strip frontmatter for body analysis
+    if body.startswith("---"):
+        end = body.find("\n---", 3)
+        if end != -1:
+            fm_text = body[3:end]
+            body = body[end + 4:].lstrip("\n")
+        else:
+            fm_text = ""
+    else:
+        fm_text = ""
+
+    # 1. Triggers
+    has_fm_triggers = _re.search(r"^triggers\s*:", fm_text, _re.MULTILINE) is not None
+    has_when_section = "## When to Use" in body
+    if not has_fm_triggers and not has_when_section:
+        warnings.append(
+            "Missing triggers: add a 'triggers' list in frontmatter or "
+            "a '## When to Use' section so agents know when to load this skill."
+        )
+
+    # 2. Verification
+    if "## Verification" not in body:
+        warnings.append(
+            "Missing verification: add a '## Verification' or "
+            "'## Verification Checklist' section with checkable completion criteria."
+        )
+
+    # 3. Fallback / Pitfalls
+    has_pitfalls = "## Common Pitfalls" in body or "## Pitfalls" in body
+    if not has_pitfalls:
+        warnings.append(
+            "Missing fallback guidance: add a '## Common Pitfalls' section "
+            "documenting what can go wrong and how to recover."
+        )
+
+    # 4. Self-contained
+    has_related = _re.search(r"^related_skills\s*:", fm_text, _re.MULTILINE) is not None
+    has_prereqs = "## Prerequisites" in body or "## Requirements" in body
+    if not has_related and not has_prereqs:
+        warnings.append(
+            "Not self-contained: add 'related_skills' in frontmatter or a "
+            "'## Prerequisites' section naming what context the reader needs."
+        )
+
+    # 5. Compact (body size proxy)
+    body_bytes = len(body.encode("utf-8"))
+    if body_bytes > 20_000:
+        warnings.append(
+            f"Body is {body_bytes/1024:.0f} KB — consider trimming "
+            f"no-op prose and pushing bulky reference material to "
+            f"references/ files."
+        )
+
+    # 6. Description quality
+    try:
+        desc_match = _re.search(r"^description\s*:\s*(.*)", fm_text, _re.MULTILINE)
+        if desc_match:
+            desc = desc_match.group(1).strip().strip("\"'")
+            if len(desc) > 200:
+                warnings.append(
+                    f"Description is {len(desc)} chars (max 200 recommended). "
+                    f"A shorter, trigger-oriented description helps agents "
+                    f"decide when to load the skill."
+                )
+    except Exception:
+        pass
+
+    return warnings
+
+
 def _resolve_skill_dir(name: str, category: str = None) -> Path:
     """Build the directory path for a new skill, optionally under a category."""
     if category:
@@ -810,6 +902,12 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
     if err:
         return {"success": False, "error": err}
 
+    # Quality gate — soft validation that warns but doesn't block
+    quality_warnings = _validate_quality(content, name)
+    if quality_warnings:
+        # Attach to the eventual result as a non-fatal advisory
+        pass
+
     # Check for name collisions across all directories
     existing = _find_skill(name)
     if existing:
@@ -849,6 +947,13 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
         "skill_md": str(skill_md),
         "_change": {"description": _desc},
     }
+    if quality_warnings:
+        result["quality_warnings"] = quality_warnings
+        result["quality_score"] = max(0, 6 - len(quality_warnings))  # 0-6 score
+        result["message"] = (
+            f"Skill '{name}' created ({len(quality_warnings)}/6 quality checks "
+            f"missing — see quality_warnings)."
+        )
     if category:
         result["category"] = category
     result["hint"] = (
