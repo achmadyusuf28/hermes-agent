@@ -42,7 +42,7 @@ import contextvars as _ctxvars
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from hermes_constants import get_hermes_home, display_hermes_home
+from hermes_constants import get_hermes_home, get_nix_skills_dir, display_hermes_home
 from utils import atomic_replace, is_truthy_value
 from hermes_cli.config import cfg_get
 
@@ -668,10 +668,183 @@ def _validate_quality(content: str, name: str) -> list[str]:
 
 
 def _resolve_skill_dir(name: str, category: str = None) -> Path:
-    """Build the directory path for a new skill, optionally under a category."""
+    """Build the directory path for a new skill, optionally under a category.
+
+    When ``get_nix_skills_dir()`` exists, new skills are created as Nix
+    modules under ``~/.hermes/nix-skills/`` instead of markdown under
+    ``~/.hermes/skills/``.
+    """
+    nix_dir = get_nix_skills_dir()
+    if nix_dir.exists() and nix_dir.is_dir():
+        if category:
+            return nix_dir / category / f"{name}.nix"
+        return nix_dir / f"{name}.nix"
     if category:
         return _skills_dir() / category / name
     return _skills_dir() / name
+
+
+def _md_to_nix_skill(name: str, content: str, category: str = None) -> str:
+    """Convert markdown skill content (YAML frontmatter + body) to a Nix module.
+
+    Returns the Nix module file content as a string.
+    """
+    from agent.skill_utils import parse_frontmatter as _parse_md_fm
+
+    # Parse frontmatter and body
+    fm, body = _parse_md_fm(content)
+
+    # Extract fields from frontmatter
+    description = fm.get("description", "")
+    skill_type = fm.get("type", _infer_nix_type(body, category))
+    triggers_raw = fm.get("triggers", [])
+    if isinstance(triggers_raw, str):
+        triggers_raw = [triggers_raw]
+
+    # Extract pitfalls, steps from body sections
+    pitfalls = _extract_section_items(body, "Common Pitfalls", "Pitfalls", "Gotchas")
+    steps = _extract_section_items(body, "Steps", "Workflow", "Procedure", "Core Loop")
+
+    # Escape strings for Nix
+    def _nix_str(s: str) -> str:
+        escaped = s.replace("''", "'''").replace("${", "''${")
+        return f"''\n    {escaped}\n  ''"
+
+    def _nix_short_str(s: str) -> str:
+        escaped = s.replace("\\", "\\\\").replace('"', '\\"').replace("${", "\\${")
+        return f'  "{escaped}"'
+
+    def _nix_list_str(items: list) -> str:
+        if not items:
+            return "[ ]"
+        parts = []
+        for item in items[:20]:
+            if len(str(item)) < 80 and "\n" not in item:
+                parts.append(_nix_short_str(str(item)))
+            else:
+                parts.append(f"  {_nix_str(str(item))}")
+        return "[\n" + "\n".join(parts) + "\n]"
+
+    # Build fields
+    fields = []
+    desc_escaped = description.replace("\\", "\\\\").replace('"', '\\"')
+    fields.append(f'  description = "{desc_escaped}";')
+
+    if triggers_raw:
+        fields.append(f"  triggers = {_nix_list_str(triggers_raw)};")
+
+    fields.append(f'  type = "{skill_type}";')
+
+    if skill_type == "workflow" and steps:
+        fields.append(f"  steps = {_nix_list_str(steps)};")
+
+    if skill_type == "knowledge":
+        # Use body as knowledge content (strip frontmatter noise)
+        # Remove sections that were already extracted
+        body_clean = _strip_sections(body, "Verification Checklist", "Verification",
+                                     "Common Pitfalls", "Pitfalls", "Reference Files",
+                                     "Related Skills", "Prerequisites")
+        if body_clean.strip():
+            fields.append(f"  knowledge = {_nix_str(body_clean.strip())};")
+
+    if pitfalls:
+        fields.append(f"  pitfalls = {_nix_list_str(pitfalls)};")
+
+    # Check for verify section
+    verify_items = _extract_section_items(body, "Verification Checklist", "Verification")
+    if verify_items:
+        fields.append(f"  verify = {_nix_list_str(verify_items)};")
+
+    # Generate the Nix module file
+    safe_name = name.lower().replace(" ", "-").replace("_", "-")
+    safe_name = re.sub(r"[^a-z0-9-]", "", safe_name).strip("-")
+    if not safe_name:
+        safe_name = "unnamed"
+
+    nix_content = f"""# {safe_name}.nix — Hermes skill module
+# Category: {category or "nix"}
+# Source: agent-created
+
+{{ config, lib, pkgs, ... }}:
+with lib;
+let
+  cfg = config.hermes.skills.{safe_name};
+in
+{{
+  options.hermes.skills.{safe_name} = {{
+    enable = mkEnableOption "{desc_escaped}";
+  }};
+
+  config = mkIf cfg.enable {{
+    hermes.skills.{safe_name} = {{
+      enable = true;
+{chr(10).join(fields)}
+    }};
+  }};
+}}
+"""
+    return nix_content
+
+
+def _infer_nix_type(body: str, category: str = None) -> str:
+    """Infer skill type from body content for Nix module generation."""
+    body_lower = body.lower()
+    if category == "workflow":
+        return "workflow"
+    if re.search(r"^\d+[.)]\s+", body, re.MULTILINE):
+        return "workflow"
+    if "## Steps" in body or "## Workflow" in body:
+        return "workflow"
+    code_blocks = re.findall(r"```(?:bash|sh|python|nix|shell)\n(.*?)```", body, re.DOTALL)
+    if code_blocks:
+        for block in code_blocks:
+            if re.search(r"(apt|pip|npm|curl|git |ssh|nix |systemctl|docker|kubectl|gh )", block):
+                return "tool"
+    return "knowledge"
+
+
+def _extract_section_items(body: str, *headings: str) -> list:
+    """Extract list items from a section."""
+    import sys
+    for heading in headings:
+        pattern = re.compile(
+            r'^##+\s+' + re.escape(heading) + r'\s*\n(.*?)(?=^#|\Z)',
+            re.MULTILINE | re.DOTALL
+        )
+        match = pattern.search(body)
+        if match:
+            section = match.group(1).strip()
+            items = []
+            for line in section.split("\n"):
+                stripped = line.strip()
+                m = re.match(r'^[-*]\s+(.*)', stripped)
+                if m:
+                    items.append(m.group(1).strip())
+                    continue
+                m = re.match(r'^- \[[ x]\]\s+(.*)', stripped)
+                if m:
+                    items.append(m.group(1).strip())
+                    continue
+                m = re.match(r'^\d+[.)]\s+(.*)', stripped)
+                if m:
+                    items.append(m.group(1).strip())
+            if items:
+                return items
+    return []
+
+
+def _strip_sections(body: str, *headings: str) -> str:
+    """Remove named sections from body."""
+    result = body
+    for heading in headings:
+        result = re.sub(
+            r'^##+\s+' + re.escape(heading) + r'\s*\n.*?(?=^##|\Z)',
+            '',
+            result,
+            flags=re.MULTILINE | re.DOTALL,
+        )
+    result = re.sub(r'\n{3,}', '\n\n', result)
+    return result.strip()
 
 
 def _find_skill(name: str) -> Optional[Dict[str, Any]]:
@@ -690,7 +863,14 @@ def _find_skill(name: str) -> Optional[Dict[str, Any]]:
             if is_excluded_skill_path(skill_md):
                 continue
             if skill_md.parent.name == name:
-                return {"path": skill_md.parent}
+                return {"path": skill_md.parent, "source": "markdown"}
+    # Also search Nix skills directory
+    nix_dir = get_nix_skills_dir()
+    if nix_dir.exists():
+        for nix_path in nix_dir.rglob(f"{name}.nix"):
+            if nix_path.name == "default.nix":
+                continue
+            return {"path": nix_path, "source": "nix"}
     return None
 
 
@@ -916,19 +1096,45 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
             "error": f"A skill named '{name}' already exists at {existing['path']}."
         }
 
-    # Create the skill directory
-    skill_dir = _resolve_skill_dir(name, category)
-    skill_dir.mkdir(parents=True, exist_ok=True)
+    # Determine output mode: Nix module or markdown
+    nix_skills_dir = get_nix_skills_dir()
+    use_nix = nix_skills_dir.exists() and nix_skills_dir.is_dir()
 
-    # Write SKILL.md atomically
-    skill_md = skill_dir / "SKILL.md"
-    _atomic_write_text(skill_md, content)
+    # Create the skill directory/file
+    skill_path = _resolve_skill_dir(name, category)
 
-    # Security scan — roll back on block
-    scan_error = _security_scan_skill(skill_dir)
-    if scan_error:
-        shutil.rmtree(skill_dir, ignore_errors=True)
-        return {"success": False, "error": scan_error}
+    if use_nix:
+        # Write Nix module
+        nix_content = _md_to_nix_skill(name, content, category)
+        skill_path.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_write_text(skill_path, nix_content)
+        result = {
+            "success": True,
+            "message": f"Skill '{name}' created as Nix module.",
+            "path": str(skill_path),
+            "source": "nix",
+        }
+    else:
+        # Fall back to legacy markdown skill directory
+        skill_dir = skill_path  # skill_path is a directory for markdown mode
+        skill_dir.mkdir(parents=True, exist_ok=True)
+
+        # Write SKILL.md atomically
+        skill_md = skill_dir / "SKILL.md"
+        _atomic_write_text(skill_md, content)
+
+        # Security scan — roll back on block
+        scan_error = _security_scan_skill(skill_dir)
+        if scan_error:
+            shutil.rmtree(skill_dir, ignore_errors=True)
+            return {"success": False, "error": scan_error}
+
+        result = {
+            "success": True,
+            "message": f"Skill '{name}' created.",
+            "path": str(skill_dir.relative_to(_skills_dir())),
+            "skill_md": str(skill_md),
+        }
 
     # Extract description from frontmatter for verbose notifications
     _desc = ""
@@ -940,13 +1146,7 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
     except Exception:
         pass
 
-    result = {
-        "success": True,
-        "message": f"Skill '{name}' created.",
-        "path": str(skill_dir.relative_to(_skills_dir())),
-        "skill_md": str(skill_md),
-        "_change": {"description": _desc},
-    }
+    result["_change"] = {"description": _desc}
     if quality_warnings:
         result["quality_warnings"] = quality_warnings
         result["quality_score"] = max(0, 6 - len(quality_warnings))  # 0-6 score
@@ -964,7 +1164,11 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
 
 
 def _edit_skill(name: str, content: str) -> Dict[str, Any]:
-    """Replace the SKILL.md of any existing skill (full rewrite)."""
+    """Replace the content of an existing skill (full rewrite).
+
+    For Nix modules: converts markdown → Nix module format and rewrites
+    the .nix file. For legacy markdown: rewrites SKILL.md.
+    """
     err = _validate_frontmatter(content)
     if err:
         return {"success": False, "error": err}
@@ -980,6 +1184,30 @@ def _edit_skill(name: str, content: str) -> Dict[str, Any]:
     if guard:
         return guard
 
+    source = existing.get("source", "markdown")
+
+    if source == "nix":
+        skill_path = existing["path"]
+        if not skill_path.exists():
+            return {"success": False, "error": f"Skill file not found: {skill_path}"}
+
+        read_guard = _background_review_read_before_write_guard(
+            name, skill_path, "edit", skill_path.name
+        )
+        if read_guard:
+            return read_guard
+
+        nix_content = _md_to_nix_skill(name, content)
+        _atomic_write_text(skill_path, nix_content)
+
+        return {
+            "success": True,
+            "message": f"Skill '{name}' updated (Nix module rewrite).",
+            "path": str(skill_path),
+            "source": "nix",
+        }
+
+    # Legacy markdown path
     skill_md = existing["path"] / "SKILL.md"
     read_guard = _background_review_read_before_write_guard(
         name, skill_md, "edit", "SKILL.md"
@@ -1037,8 +1265,9 @@ def _patch_skill(
     if not existing:
         return {"success": False, "error": _skill_not_found_error(name)}
 
-    skill_dir = existing["path"]
-    guard = _background_review_write_guard(name, skill_dir, "patch")
+    skill_path = existing["path"]
+    source = existing.get("source", "markdown")
+    guard = _background_review_write_guard(name, skill_path, "patch")
     if guard:
         return guard
 
@@ -1047,13 +1276,16 @@ def _patch_skill(
         err = _validate_file_path(file_path)
         if err:
             return {"success": False, "error": err}
-        target, err = _resolve_skill_target(skill_dir, file_path)
+        target, err = _resolve_skill_target(skill_path, file_path)
         if err:
             return {"success": False, "error": err}
         assert target is not None
     else:
-        # Patching SKILL.md
-        target = skill_dir / "SKILL.md"
+        # Patching the skill's main file (SKILL.md or .nix)
+        if source == "nix":
+            target = skill_path  # .nix file directly
+        else:
+            target = skill_path / "SKILL.md"
 
     if not target.exists():
         return {"success": False, "error": f"File not found: {target.relative_to(skill_dir)}"}
@@ -1112,7 +1344,7 @@ def _patch_skill(
     _atomic_write_text(target, new_content)
 
     # Security scan — roll back on block
-    scan_error = _security_scan_skill(skill_dir)
+    scan_error = _security_scan_skill(skill_path)
     if scan_error:
         _atomic_write_text(target, original_content)
         return {"success": False, "error": scan_error}
@@ -1183,11 +1415,30 @@ def _delete_skill(name: str, absorbed_into: Optional[str] = None) -> Dict[str, A
                 ),
             }
 
-    skill_dir = existing["path"]
-    skills_root = _containing_skills_root(skill_dir)
+    skill_path = existing["path"]
+    source = existing.get("source", "markdown")
+    skills_root = _containing_skills_root(skill_path) if source == "markdown" else skill_path.parent
 
+    if source == "nix":
+        # Nix skill: delete just the .nix file
+        if not skill_path.exists():
+            return {"success": False, "error": f"Nix skill file not found: {skill_path}"}
+        os.remove(skill_path)
+
+        # Also try to remove empty parent dirs
+        try:
+            skill_path.parent.rmdir()  # only succeeds if empty
+        except OSError:
+            pass
+
+        msg = f"Skill '{name}' (Nix module) deleted."
+        if is_consolidation:
+            msg += f" Content absorbed into '{absorbed_target}'."
+        return {"success": True, "message": msg, "source": "nix"}
+
+    # Markdown skill: defense and directory removal
     # Defense-in-depth before the recursive delete (port of Kilo Code #11240).
-    unsafe = _validate_delete_target(skill_dir)
+    unsafe = _validate_delete_target(skill_path)
     if unsafe:
         return {"success": False, "error": unsafe}
 
@@ -1217,10 +1468,10 @@ def _delete_skill(name: str, absorbed_into: Optional[str] = None) -> Dict[str, A
             message += f" Content absorbed into '{absorbed_target}'."
         return {"success": True, "message": message, "_archived": True}
 
-    shutil.rmtree(skill_dir)
+    shutil.rmtree(skill_path)
 
     # Clean up empty category directories (don't remove the skills root itself)
-    parent = skill_dir.parent
+    parent = skill_path.parent
     if parent != skills_root and parent.exists() and not any(parent.iterdir()):
         parent.rmdir()
 

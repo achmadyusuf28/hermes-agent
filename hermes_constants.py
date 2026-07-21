@@ -925,6 +925,16 @@ def get_skills_dir() -> Path:
     return get_hermes_home() / "skills"
 
 
+def get_nix_skills_dir() -> Path:
+    """Return the path to the Nix skill modules directory under HERMES_HOME.
+
+    Skills written as Nix modules live here, side-by-side with the legacy
+    markdown-based skills. The agent reads from both; new skill_manage()
+    writes here.
+    """
+    return get_hermes_home() / "nix-skills"
+
+
 
 def get_env_path() -> Path:
     """Return the path to the ``.env`` file under HERMES_HOME."""

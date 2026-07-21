@@ -807,6 +807,149 @@ def iter_skill_index_files(skills_dir: Path, filename: str):
         yield Path(path)
 
 
+# ── Nix skill module support ────────────────────────────────────────────
+
+_NIX_SKILL_TYPE_RE = re.compile(r'type\s*=\s*"([^"]+)"')
+_NIX_SKILL_DESC_RE = re.compile(r'mkEnableOption\s+"([^"]+)"', re.DOTALL)
+_NIX_SKILL_TRIGGERS_RE = re.compile(r'triggers\s*=\s*\[(.*?)\]', re.DOTALL)
+_NIX_SKILL_ATTR_VALUE_RE = re.compile(r'\s+"([^"]+)"\s')
+_NIX_SKILL_STEPS_RE = re.compile(r'steps\s*=\s*\[(.*?)\]', re.DOTALL)
+_NIX_SKILL_PITFALLS_RE = re.compile(r'pitfalls\s*=\s*\[(.*?)\]', re.DOTALL)
+_NIX_SKILL_NIXSTR_RE = re.compile(r"''\n?(.*?)\n?''", re.DOTALL)
+_NIX_SKILL_VERIFY_RE = re.compile(r'verify\s*=\s*(".*?")', re.DOTALL)
+_NIX_SKILL_KNOWLEDGE_RE = re.compile(r'knowledge\s*=\s*(".*?")', re.DOTALL)
+_NIX_SKILL_EXAMPLE_RE = re.compile(r'example\s*=\s*(".*?")', re.DOTALL)
+
+
+def _extract_nix_string_list(text: str) -> list[str]:
+    """Extract list items from a Nix ``[ "a" "b" ... ]`` literal."""
+    items = []
+    for m in _NIX_SKILL_ATTR_VALUE_RE.finditer(text):
+        items.append(m.group(1))
+    return items
+
+
+def parse_nix_skill(path: Path) -> Dict[str, Any]:
+    """Parse a Nix skill module file and extract metadata.
+
+    Returns a dict with keys matching the frontmatter format used by
+    markdown skills: name, description, category, type, triggers,
+    pitfalls, steps (for workflow skills), knowledge (for knowledge
+    skills), verify (for tool skills).
+
+    For non-skill .nix files (e.g. aggregator default.nix), returns None.
+    """
+    try:
+        content = path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return None
+
+    # Must be a skill module (has mkEnableOption)
+    if "mkEnableOption" not in content:
+        return None
+
+    name = path.stem  # filename without .nix
+
+    # Extract description from mkEnableOption "..."
+    desc_match = _NIX_SKILL_DESC_RE.search(content)
+    description = desc_match.group(1) if desc_match else ""
+
+    # Extract type
+    type_match = _NIX_SKILL_TYPE_RE.search(content)
+    skill_type = type_match.group(1) if type_match else "knowledge"
+
+    # Extract triggers
+    triggers = []
+    trig_match = _NIX_SKILL_TRIGGERS_RE.search(content)
+    if trig_match:
+        triggers = _extract_nix_string_list(trig_match.group(1))
+
+    # Extract pitfalls
+    pitfalls = []
+    pit_match = _NIX_SKILL_PITFALLS_RE.search(content)
+    if pit_match:
+        raw = pit_match.group(1).strip()
+        # Extract from '' strings (multiline Nix strings)
+        for block in _NIX_SKILL_NIXSTR_RE.findall(raw):
+            pitfalls.append(block.strip())
+
+    # Extract steps (workflow type)
+    steps = []
+    steps_match = _NIX_SKILL_STEPS_RE.search(content)
+    if steps_match:
+        raw = steps_match.group(1).strip()
+        for block in _NIX_SKILL_NIXSTR_RE.findall(raw):
+            steps.append(block.strip())
+
+    # Extract knowledge (double-quoted string or '' string)
+    knowledge = ""
+    know_match = _NIX_SKILL_KNOWLEDGE_RE.search(content)
+    if know_match:
+        knowledge = know_match.group(1).strip().strip('"')
+    if not knowledge:
+        know_match2 = re.search(r'knowledge\s*=\s*""(.*?)""', content, re.DOTALL)
+        if know_match2:
+            knowledge = know_match2.group(1).strip()
+    if not knowledge:
+        know_match3 = _NIX_SKILL_NIXSTR_RE.search(content)
+        if know_match3:
+            knowledge = know_match3.group(1).strip()
+
+    # Extract verify
+    verify = ""
+    ver_match = _NIX_SKILL_VERIFY_RE.search(content)
+    if ver_match:
+        verify = ver_match.group(1).strip().strip('"')
+    if not verify:
+        ver_match2 = re.search(r'verify\s*=\s*""(.*?)""', content, re.DOTALL)
+        if ver_match2:
+            verify = ver_match2.group(1).strip()
+
+    # Extract example
+    example = ""
+    ex_match = _NIX_SKILL_EXAMPLE_RE.search(content)
+    if ex_match:
+        example = ex_match.group(1).strip().strip('"')
+    if not example:
+        ex_match2 = re.search(r'example\s*=\s*""(.*?)""', content, re.DOTALL)
+        if ex_match2:
+            example = ex_match2.group(1).strip()
+
+    # Infer category from parent directory name
+    category = path.parent.name
+    if category in ("nix-skills", "hermes-skills", "skills"):
+        category = "nix"
+
+    return {
+        "name": name,
+        "description": description,
+        "type": skill_type,
+        "category": category,
+        "triggers": triggers,
+        "pitfalls": pitfalls,
+        "steps": steps,
+        "knowledge": knowledge,
+        "verify": verify,
+        "example": example,
+    }
+
+
+def iter_nix_skill_files(nix_dir: Path):
+    """Walk *nix_dir* yielding sorted paths to ``*.nix`` skill modules.
+
+    Excludes aggregator ``default.nix`` and any file that isn't a valid
+    skill module (no ``mkEnableOption``).
+    """
+    if not nix_dir.exists():
+        return
+    for root, dirs, files in os.walk(str(nix_dir), followlinks=True):
+        dirs[:] = [d for d in dirs if d not in EXCLUDED_SKILL_DIRS]
+        for fname in sorted(files):
+            if not fname.endswith(".nix") or fname == "default.nix":
+                continue
+            yield Path(root) / fname
+
+
 # ── Namespace helpers for plugin-provided skills ───────────────────────────
 
 _NAMESPACE_RE = re.compile(r"^[a-zA-Z0-9_-]+$")

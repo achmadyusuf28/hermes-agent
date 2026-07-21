@@ -70,7 +70,7 @@ import json
 import logging
 import time
 
-from hermes_constants import get_hermes_home, display_hermes_home
+from hermes_constants import get_hermes_home, get_nix_skills_dir, display_hermes_home
 import os
 import re
 from enum import Enum
@@ -83,6 +83,8 @@ from utils import env_var_enabled
 from agent.skill_utils import (
     EXCLUDED_SKILL_DIRS as _EXCLUDED_SKILL_DIRS,
     is_skill_support_path as _is_skill_support_path,
+    parse_nix_skill as _parse_nix_skill,
+    iter_nix_skill_files as _iter_nix_skill_files,
 )
 
 logger = logging.getLogger(__name__)
@@ -769,6 +771,49 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
                 )
                 continue
 
+    # ── Scan Nix skill modules ────────────────────────────────────────
+    nix_skills_dir = get_nix_skills_dir()
+    nix_dirs_to_scan = []
+    if nix_skills_dir.exists():
+        nix_dirs_to_scan.append(nix_skills_dir)
+
+    # Also scan bundled Nix skills in the hermes-agent repo
+    bundled_nix_dir = Path("/home/hermes/hermes-agent/hermes-skills")
+    if bundled_nix_dir.exists():
+        nix_dirs_to_scan.append(bundled_nix_dir)
+
+    for nix_dir in nix_dirs_to_scan:
+        for nix_path in _iter_nix_skill_files(nix_dir):
+            try:
+                nix_meta = _parse_nix_skill(nix_path)
+                if nix_meta is None:
+                    continue
+
+                name = nix_meta["name"][:MAX_NAME_LENGTH]
+                if name in seen_names:
+                    continue
+                if name in disabled:
+                    continue
+
+                description = nix_meta.get("description", "")
+                if len(description) > MAX_DESCRIPTION_LENGTH:
+                    description = description[:MAX_DESCRIPTION_LENGTH - 3] + "..."
+
+                category = nix_meta.get("category", "nix")
+
+                seen_names.add(name)
+                skills.append({
+                    "name": name,
+                    "description": description,
+                    "category": category,
+                    "source": "nix",
+                })
+            except Exception as e:
+                logger.debug(
+                    "Skipping Nix skill at %s: %s", nix_path, e, exc_info=True
+                )
+                continue
+
     # Store in cache keyed by the scan signature computed BEFORE the scan
     # (a write racing the scan changes the signature, so the next call
     # re-scans rather than serving the torn result past the TTL). Same
@@ -1207,6 +1252,95 @@ def skill_view(
             skill_dir, skill_md = candidates[0]
 
         if not skill_md or not skill_md.exists():
+            # Fallback: try Nix skill module
+            nix_dir = get_nix_skills_dir()
+            nix_skill_path = nix_dir / f"{name}.nix" if nix_dir.exists() else None
+            if nix_skill_path and nix_skill_path.exists():
+                nix_meta = _parse_nix_skill(nix_skill_path)
+                if nix_meta is not None:
+                    # Also check category-qualified paths (category/name.nix)
+                    pass  # handled below
+            # Try category/name.nix pattern
+            if not (nix_skill_path and nix_skill_path.exists()) and nix_dir.exists():
+                for nix_path in _iter_nix_skill_files(nix_dir):
+                    nix_meta = _parse_nix_skill(nix_path)
+                    if nix_meta and nix_meta["name"] == name:
+                        nix_skill_path = nix_path
+                        break
+
+            if nix_skill_path is not None and nix_skill_path.exists():
+                # Read and return Nix skill content
+                try:
+                    nix_meta = _parse_nix_skill(nix_skill_path)
+                    if nix_meta is not None:
+                        # Extract category from path for file_path lookups
+                        rel = nix_skill_path.relative_to(nix_dir)
+                        nix_category = rel.parent.name if rel.parent != Path(".") else None
+
+                        # Build skill content from parsed metadata
+                        parts = []
+                        parts.append(f"# {nix_meta['name']}")
+                        if nix_meta.get("description"):
+                            parts.append(f"\n{nix_meta['description']}")
+                        parts.append(f"\n**Category:** {nix_meta.get('category') or 'uncategorized'}")
+                        parts.append(f"**Type:** {nix_meta.get('type', 'knowledge')}")
+                        parts.append(f"**Source:** Nix module (`{nix_skill_path}`)")
+
+                        if nix_meta.get("triggers"):
+                            parts.append(f"\n## Triggers")
+                            for t in nix_meta["triggers"]:
+                                parts.append(f"- {t}")
+
+                        if nix_meta.get("steps"):
+                            parts.append(f"\n## Steps")
+                            for i, s in enumerate(nix_meta["steps"], 1):
+                                parts.append(f"\n### Step {i}")
+                                parts.append(s)
+
+                        if nix_meta.get("knowledge"):
+                            parts.append(f"\n## Knowledge")
+                            parts.append(nix_meta["knowledge"])
+
+                        if nix_meta.get("verify"):
+                            parts.append(f"\n## Verification")
+                            parts.append(nix_meta["verify"])
+
+                        if nix_meta.get("pitfalls"):
+                            parts.append(f"\n## Common Pitfalls")
+                            for p in nix_meta["pitfalls"]:
+                                parts.append(f"- {p}")
+
+                        if nix_meta.get("example"):
+                            parts.append(f"\n## Example")
+                            parts.append(nix_meta["example"])
+
+                        # Check for file_path within the nix skill dir
+                        linked_files = {}
+                        if file_path:
+                            fp_resolved = nix_skill_path.parent / file_path
+                            if fp_resolved.exists():
+                                fp_content = fp_resolved.read_text(encoding="utf-8", errors="replace")
+                            else:
+                                fp_content = None
+                        else:
+                            fp_content = None
+
+                        result = {
+                            "success": True,
+                            "name": nix_meta["name"],
+                            "category": nix_category or nix_meta.get("category"),
+                            "content": "\n\n".join(parts),
+                            "linked_files": linked_files,
+                            "source": "nix",
+                            "file_path": str(nix_skill_path),
+                        }
+                        if fp_content is not None:
+                            result["file_content"] = fp_content
+
+                        return json.dumps(result, ensure_ascii=False)
+                except Exception as e:
+                    logger.debug("Failed to read Nix skill '%s': %s", name, e)
+
             available = [s["name"] for s in _sort_skills(_find_all_skills())[:20]]
             return json.dumps(
                 {
