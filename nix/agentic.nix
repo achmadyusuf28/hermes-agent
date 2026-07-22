@@ -37,8 +37,8 @@
 let
   inherit (lib) types mkOption mkIf mkEnableOption;
 
-  # ── Skill type (tool | knowledge | workflow | meta) ───────────────────
-  skillTypeEnum = types.enum [ "tool" "knowledge" "workflow" "meta" ];
+    # ── Skill type (tool | knowledge | workflow | meta | remediation) ──
+  skillTypeEnum = types.enum [ "tool" "knowledge" "workflow" "meta" "remediation" ];
 
   # ── Shared skill submodule (used by hermes.skills.*) ──────────────────
   skillSubmodule = types.submodule {
@@ -49,10 +49,11 @@ let
         type = skillTypeEnum;
         description = ''
           What kind of skill this is. Determines which quality checks apply:
-          - tool:      has action + verify, executable
-          - knowledge: has knowledge field, no action — conceptual reference
-          - workflow:  has steps, describes multi-step process
-          - meta:      self-validating (triage, benchmarks)
+          - tool:        has action + verify, executable
+          - knowledge:   has knowledge field, no action — conceptual reference
+          - workflow:    has steps or pipeline, describes multi-step process
+          - meta:        self-validating (triage, benchmarks)
+          - remediation: has remediate + check, maps failures to fixes
         '';
         example = "tool";
       };
@@ -188,6 +189,68 @@ let
           - medium:    auto-remediate + notify
           - high:      human approval required
           - critical:  human approval + escalation path
+        '';
+      };
+
+      # ── P1 Fields: Health Checks & Type Safety ────────────────────────
+      check = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        description = ''
+          Shell command that checks whether this skill's concern is healthy.
+          Exit 0 = healthy, non-zero = unhealthy.
+          When set, the autonomic loop runs this command instead of a
+          hardcoded check. The check frequency is controlled by
+          check_interval.
+          Example: "pg_isready -h 127.0.0.1"
+        '';
+      };
+
+      check_interval = mkOption {
+        type = types.str;
+        default = "5m";
+        description = ''
+          How often to run the check command. Overrides the autonomic loop's
+          global tick rate (default 5 minutes).
+          Format: human duration like "30s", "5m", "1h".
+          Example: "30s" (for critical services like PostgreSQL)
+        '';
+      };
+
+      # ── P3 Fields: Lifecycle & Governance ────────────────────────────
+      version = mkOption {
+        type = types.int;
+        default = 1;
+        description = "Skill version number. Increment on breaking changes.";
+      };
+
+      status = mkOption {
+        type = types.enum [ "stable" "experimental" "deprecated" ];
+        default = "stable";
+        description = ''
+          Lifecycle stage:
+          - stable:       ready for production use
+          - experimental: still being validated, may change
+          - deprecated:   do not use, replaced by newer skill
+        '';
+      };
+
+      changelog = mkOption {
+        type = types.listOf types.str;
+        default = [ ];
+        description = ''
+          Version history notes. Each entry describes what changed in that
+          version. Oldest first.
+          Example: [ "v1: initial version" "v2: added remediate rules" ]
+        '';
+      };
+
+      author = mkOption {
+        type = types.str;
+        default = "";
+        description = ''
+          Who created or maintains this skill.
+          Example: "Hermes", "Yusuf", "achmadyusuf28"
         '';
       };
     };
@@ -407,6 +470,13 @@ in {
               '';
             }
             {
+              assertion = skill.type != "tool" || skill.steps != [ ];
+              message = ''
+                hermes.skills.${name} has type "tool" but no steps.
+                Tool skills must define ordered steps to execute.
+              '';
+            }
+            {
               assertion = skill.type != "knowledge" || skill.knowledge != null;
               message = ''
                 hermes.skills.${name} has type "knowledge" but no knowledge field.
@@ -414,10 +484,31 @@ in {
               '';
             }
             {
-              assertion = skill.type != "workflow" || skill.steps != [ ];
+              assertion = skill.type != "workflow" || (skill.steps != [ ] || skill.pipeline != [ ]);
               message = ''
-                hermes.skills.${name} has type "workflow" but no steps.
-                Workflow skills must define ordered steps.
+                hermes.skills.${name} has type "workflow" but no steps or pipeline.
+                Workflow skills must define ordered steps or a pipeline of sub-skills.
+              '';
+            }
+            {
+              assertion = skill.type != "meta" || skill.pipeline != [ ];
+              message = ''
+                hermes.skills.${name} has type "meta" but no pipeline.
+                Meta skills orchestrate sub-skills; they must define a pipeline.
+              '';
+            }
+            {
+              assertion = skill.type != "remediation" || skill.remediate != { };
+              message = ''
+                hermes.skills.${name} has type "remediation" but no remediate mapping.
+                Remediation skills must map failure conditions to fix actions.
+              '';
+            }
+            {
+              assertion = skill.type != "remediation" || skill.check != null;
+              message = ''
+                hermes.skills.${name} has type "remediation" but no check command.
+                Remediation skills must define a health check command.
               '';
             }
             {

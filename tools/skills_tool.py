@@ -1335,6 +1335,34 @@ def skill_view(
                             parts.append(f"\n## Example")
                             parts.append(nix_meta["example"])
 
+                        # P1 fields
+                        ck = nix_meta.get("check")
+                        if ck:
+                            ci = nix_meta.get("check_interval", "5m")
+                            parts.append(f"\n**Health check:** `{ck}` (every {ci})")
+
+                        # P3 fields
+                        author = nix_meta.get("author", "")
+                        ver = nix_meta.get("version", 1)
+                        st = nix_meta.get("status", "stable")
+                        status_icons = {"stable": "✅", "experimental": "🧪", "deprecated": "⚠️"}
+
+                        meta_parts = []
+                        if author:
+                            meta_parts.append(f"by {author}")
+                        if ver > 1:
+                            meta_parts.append(f"v{ver}")
+                        if st != "stable":
+                            meta_parts.append(f"{status_icons.get(st, '')} {st}")
+
+                        if meta_parts:
+                            parts.append(f"\n**{' · '.join(meta_parts)}**")
+
+                        if nix_meta.get("changelog"):
+                            parts.append(f"\n## Changelog")
+                            for entry in nix_meta["changelog"]:
+                                parts.append(f"- {entry}")
+
                         # Check for file_path within the nix skill dir
                         linked_files = {}
                         if file_path:

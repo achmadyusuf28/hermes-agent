@@ -775,6 +775,47 @@ def _md_to_nix_skill(name: str, content: str, category: str = None) -> str:
             rem_parts.append(f'    {key_esc} = "{val_esc}"')
         fields.append(f"  remediate = {{\n" + "\n".join(rem_parts) + "\n  }};")
 
+    # P1 fields
+    check = fm.get("check")
+    if check:
+        check_str = str(check).replace('"', '\\"')
+        fields.append(f'  check = "{check_str}";')
+    check_interval = fm.get("check_interval")
+    if check_interval and str(check_interval) != "5m":
+        fields.append(f'  check_interval = "{check_interval}";')
+
+    # P3 fields
+    version = fm.get("version", 1)
+    if isinstance(version, str):
+        try:
+            version = int(version)
+        except ValueError:
+            version = 1
+    if version != 1:
+        fields.append(f"  version = {version};")
+    status = fm.get("status", "stable")
+    if status != "stable":
+        fields.append(f'  status = "{status}";')
+    changelog = fm.get("changelog", [])
+    if isinstance(changelog, str):
+        changelog = [changelog]
+    elif isinstance(changelog, list):
+        # YAML may parse "- v1: text" as dict items; normalize to strings
+        normalized = []
+        for item in changelog:
+            if isinstance(item, dict):
+                for k, v in item.items():
+                    normalized.append(f"{k}: {v}")
+            elif isinstance(item, str):
+                normalized.append(item)
+        changelog = normalized
+    if changelog:
+        fields.append(f"  changelog = {_nix_list_str(changelog)};")
+    author = fm.get("author", "")
+    if author:
+        author_esc = str(author).replace('"', '\\"')
+        fields.append(f'  author = "{author_esc}";')
+
     # Check for verify section
     verify_items = _extract_section_items(body, "Verification Checklist", "Verification")
     if verify_items:

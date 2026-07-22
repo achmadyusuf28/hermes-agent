@@ -824,6 +824,12 @@ _NIX_SKILL_PIPELINE_RE = re.compile(r'pipeline\s*=\s*\[(.*?)\]', re.DOTALL)
 _NIX_SKILL_SEVERITY_RE = re.compile(r'severity\s*=\s*"([^"]+)"')
 _NIX_SKILL_REMEDIATE_RE = re.compile(r'remediate\s*=\s*\{(.*?)\}', re.DOTALL)
 _NIX_ATTR_ASSIGN_RE = re.compile(r'(\S+)\s*=\s*"([^"]+)"')
+_NIX_SKILL_CHECK_RE = re.compile(r'check\s*=\s*(".*?")', re.DOTALL)
+_NIX_SKILL_CHECK_INTERVAL_RE = re.compile(r'check_interval\s*=\s*"([^"]+)"')
+_NIX_SKILL_VERSION_RE = re.compile(r'version\s*=\s*(\d+)')
+_NIX_SKILL_STATUS_RE = re.compile(r'status\s*=\s*"([^"]+)"')
+_NIX_SKILL_CHANGELOG_RE = re.compile(r'changelog\s*=\s*\[(.*?)\]', re.DOTALL)
+_NIX_SKILL_AUTHOR_RE = re.compile(r'author\s*=\s*"([^"]*)"')
 
 
 def _extract_nix_string_list(text: str) -> list[str]:
@@ -948,6 +954,40 @@ def parse_nix_skill(path: Path) -> Dict[str, Any]:
         for m in _NIX_ATTR_ASSIGN_RE.finditer(body):
             remediate[m.group(1)] = m.group(2)
 
+    # ── Extract P1 fields: check, check_interval ──
+    check = None
+    ck_match = _NIX_SKILL_CHECK_RE.search(content)
+    if ck_match:
+        check = ck_match.group(1).strip().strip('"')
+        if not check:
+            check = None
+
+    check_interval = "5m"
+    ci_match = _NIX_SKILL_CHECK_INTERVAL_RE.search(content)
+    if ci_match:
+        check_interval = ci_match.group(1)
+
+    # ── Extract P3 fields: version, status, changelog, author ──
+    version = 1
+    ver_match = _NIX_SKILL_VERSION_RE.search(content)
+    if ver_match:
+        version = int(ver_match.group(1))
+
+    status = "stable"
+    st_match = _NIX_SKILL_STATUS_RE.search(content)
+    if st_match:
+        status = st_match.group(1)
+
+    changelog = []
+    ch_match = _NIX_SKILL_CHANGELOG_RE.search(content)
+    if ch_match:
+        changelog = _extract_nix_string_list(ch_match.group(1))
+
+    author = ""
+    au_match = _NIX_SKILL_AUTHOR_RE.search(content)
+    if au_match:
+        author = au_match.group(1)
+
     return {
         "name": name,
         "description": description,
@@ -963,6 +1003,12 @@ def parse_nix_skill(path: Path) -> Dict[str, Any]:
         "pipeline": pipeline,
         "severity": severity,
         "remediate": remediate,
+        "check": check,
+        "check_interval": check_interval,
+        "version": version,
+        "status": status,
+        "changelog": changelog,
+        "author": author,
     }
 
 
