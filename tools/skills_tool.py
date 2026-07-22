@@ -1310,6 +1310,27 @@ def skill_view(
                             for p in nix_meta["pitfalls"]:
                                 parts.append(f"- {p}")
 
+                        # P0 fields
+                        if nix_meta.get("depends_on"):
+                            parts.append(f"\n## Depends On")
+                            for d in nix_meta["depends_on"]:
+                                parts.append(f"- {d}")
+
+                        if nix_meta.get("pipeline"):
+                            parts.append(f"\n## Pipeline")
+                            for i, p in enumerate(nix_meta["pipeline"], 1):
+                                parts.append(f"{i}. {p}")
+
+                        sev = nix_meta.get("severity", "low")
+                        if sev != "low":
+                            icon = {"low": "", "medium": "⚠️", "high": "🔴", "critical": "🚨"}
+                            parts.append(f"\n**Severity:** {icon.get(sev, '')} {sev}")
+
+                        if nix_meta.get("remediate"):
+                            parts.append(f"\n## Remediate")
+                            for cond, skill in nix_meta["remediate"].items():
+                                parts.append(f"- `{cond}` → `{skill}`")
+
                         if nix_meta.get("example"):
                             parts.append(f"\n## Example")
                             parts.append(nix_meta["example"])

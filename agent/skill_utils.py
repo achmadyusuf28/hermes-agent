@@ -819,6 +819,11 @@ _NIX_SKILL_NIXSTR_RE = re.compile(r"''\n?(.*?)\n?''", re.DOTALL)
 _NIX_SKILL_VERIFY_RE = re.compile(r'verify\s*=\s*(".*?")', re.DOTALL)
 _NIX_SKILL_KNOWLEDGE_RE = re.compile(r'knowledge\s*=\s*(".*?")', re.DOTALL)
 _NIX_SKILL_EXAMPLE_RE = re.compile(r'example\s*=\s*(".*?")', re.DOTALL)
+_NIX_SKILL_DEPENDS_RE = re.compile(r'depends_on\s*=\s*\[(.*?)\]', re.DOTALL)
+_NIX_SKILL_PIPELINE_RE = re.compile(r'pipeline\s*=\s*\[(.*?)\]', re.DOTALL)
+_NIX_SKILL_SEVERITY_RE = re.compile(r'severity\s*=\s*"([^"]+)"')
+_NIX_SKILL_REMEDIATE_RE = re.compile(r'remediate\s*=\s*\{(.*?)\}', re.DOTALL)
+_NIX_ATTR_ASSIGN_RE = re.compile(r'(\S+)\s*=\s*"([^"]+)"')
 
 
 def _extract_nix_string_list(text: str) -> list[str]:
@@ -920,6 +925,29 @@ def parse_nix_skill(path: Path) -> Dict[str, Any]:
     if category in ("nix-skills", "hermes-skills", "skills"):
         category = "nix"
 
+    # ── Extract P0 fields: depends_on, pipeline, severity, remediate ──
+    depends_on = []
+    dep_match = _NIX_SKILL_DEPENDS_RE.search(content)
+    if dep_match:
+        depends_on = _extract_nix_string_list(dep_match.group(1))
+
+    pipeline = []
+    pipe_match = _NIX_SKILL_PIPELINE_RE.search(content)
+    if pipe_match:
+        pipeline = _extract_nix_string_list(pipe_match.group(1))
+
+    severity = "low"
+    sev_match = _NIX_SKILL_SEVERITY_RE.search(content)
+    if sev_match:
+        severity = sev_match.group(1)
+
+    remediate = {}
+    rem_match = _NIX_SKILL_REMEDIATE_RE.search(content)
+    if rem_match:
+        body = rem_match.group(1)
+        for m in _NIX_ATTR_ASSIGN_RE.finditer(body):
+            remediate[m.group(1)] = m.group(2)
+
     return {
         "name": name,
         "description": description,
@@ -931,6 +959,10 @@ def parse_nix_skill(path: Path) -> Dict[str, Any]:
         "knowledge": knowledge,
         "verify": verify,
         "example": example,
+        "depends_on": depends_on,
+        "pipeline": pipeline,
+        "severity": severity,
+        "remediate": remediate,
     }
 
 

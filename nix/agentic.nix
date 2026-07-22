@@ -144,6 +144,52 @@ let
         default = null;
         description = "Usage example for this skill.";
       };
+
+      # ── P0 Fields: Composition & Routing ─────────────────────────────
+      depends_on = mkOption {
+        type = types.listOf types.str;
+        default = [ ];
+        description = ''
+          Prerequisite skills that should be loaded alongside this one.
+          The agent will skill_view() each dependency when this skill is active.
+          Example: [ "nixos-postgresql" "nixos-secrets-management" ]
+        '';
+      };
+
+      pipeline = mkOption {
+        type = types.listOf types.str;
+        default = [ ];
+        description = ''
+          Ordered list of skill names that this skill composes.
+          The agent executes each sub-skill in sequence, passing context
+          between them. Transforms this skill into an orchestrator.
+          Example: [ "nixos-flake-review" "nixos-postgresql" ]
+        '';
+      };
+
+      remediate = mkOption {
+        type = types.attrsOf types.str;
+        default = { };
+        description = ''
+          Map of failure conditions to remediation skill names.
+          The autonomic loop uses this to route failures to the right fix.
+          Keys are failure patterns (e.g. "postgres-down"), values are
+          skill names (e.g. "nixos-postgresql").
+          Example: { postgres-down = "nixos-postgresql"; }
+        '';
+      };
+
+      severity = mkOption {
+        type = types.enum [ "low" "medium" "high" "critical" ];
+        default = "low";
+        description = ''
+          Urgency level for the autonomic loop:
+          - low:       auto-remediate silently
+          - medium:    auto-remediate + notify
+          - high:      human approval required
+          - critical:  human approval + escalation path
+        '';
+      };
     };
   };
 
@@ -372,6 +418,14 @@ in {
               message = ''
                 hermes.skills.${name} has type "workflow" but no steps.
                 Workflow skills must define ordered steps.
+              '';
+            }
+            {
+              assertion = skill.pipeline == [ ] || skill.steps == [ ];
+              message = ''
+                hermes.skills.${name} has both pipeline and steps set.
+                Pipeline skills compose sub-skills; they should not also
+                define literal steps. Use one or the other.
               '';
             }
           ];

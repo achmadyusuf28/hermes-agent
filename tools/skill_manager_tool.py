@@ -701,6 +701,16 @@ def _md_to_nix_skill(name: str, content: str, category: str = None) -> str:
     if isinstance(triggers_raw, str):
         triggers_raw = [triggers_raw]
 
+    # P0 fields from frontmatter
+    depends_on = fm.get("depends_on", [])
+    if isinstance(depends_on, str):
+        depends_on = [depends_on]
+    pipeline = fm.get("pipeline", [])
+    if isinstance(pipeline, str):
+        pipeline = [pipeline]
+    severity = fm.get("severity", "low")
+    remediate = fm.get("remediate", {})
+
     # Extract pitfalls, steps from body sections
     pitfalls = _extract_section_items(body, "Common Pitfalls", "Pitfalls", "Gotchas")
     steps = _extract_section_items(body, "Steps", "Workflow", "Procedure", "Core Loop")
@@ -749,6 +759,21 @@ def _md_to_nix_skill(name: str, content: str, category: str = None) -> str:
 
     if pitfalls:
         fields.append(f"  pitfalls = {_nix_list_str(pitfalls)};")
+
+    # P0 fields
+    if depends_on:
+        fields.append(f"  depends_on = {_nix_list_str(depends_on)};")
+    if pipeline:
+        fields.append(f"  pipeline = {_nix_list_str(pipeline)};")
+    if severity != "low":
+        fields.append(f'  severity = "{severity}";')
+    if remediate:
+        rem_parts = []
+        for key, val in remediate.items():
+            key_esc = key.replace('"', '\\"')
+            val_esc = val.replace('"', '\\"')
+            rem_parts.append(f'    {key_esc} = "{val_esc}"')
+        fields.append(f"  remediate = {{\n" + "\n".join(rem_parts) + "\n  }};")
 
     # Check for verify section
     verify_items = _extract_section_items(body, "Verification Checklist", "Verification")
