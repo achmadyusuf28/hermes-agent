@@ -212,6 +212,12 @@ TOOLSETS = {
         "includes": []
     },
 
+    "nixos": {
+        "description": "NixOS evaluation, build, service management, and log query tools. Auto-hidden on non-NixOS systems.",
+        "tools": ["nix_eval", "nix_build", "nix_switch", "nix_services", "nix_logs", "nix_generations"],
+        "includes": []
+    },
+
     "context_engine": {
         "description": "Runtime tools exposed by the active context engine",
         "tools": [],

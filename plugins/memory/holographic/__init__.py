@@ -1,4 +1,5 @@
-"""hermes-memory-store — holographic memory plugin using MemoryProvider interface.
+"""
+hermes-memory-store — holographic memory plugin using MemoryProvider interface.
 
 Registers as a MemoryProvider plugin, giving the agent structured fact storage
 with entity resolution, trust scoring, and HRR-based compositional retrieval.
@@ -8,11 +9,18 @@ Original plugin by dusterbloom (PR #2351), adapted to the MemoryProvider ABC.
 Config in $HERMES_HOME/config.yaml (profile-scoped):
   plugins:
     hermes-memory-store:
-      db_path: $HERMES_HOME/memory_store.db   # omit to use the default
+      db_path: postgresql          # use PostgreSQL backend (shared PG)
+      db_path: $HERMES_HOME/memory_store.db   # default: local SQLite
       auto_extract: false
       default_trust: 0.5
       min_trust_threshold: 0.3
       temporal_decay_half_life: 0
+
+When ``db_path`` is ``"postgresql"`` (the string literal), the plugin
+switches to :class:`PostgreSQLMemoryStore` — same API, same tables, backed
+by the shared PostgreSQL database instead of a local SQLite file.  This
+makes facts visible from every node that connects to the same PG DSN
+(configured via ``sessiondb.dsn``).
 """
 
 from __future__ import annotations
@@ -25,6 +33,7 @@ from typing import Any, Dict, List
 from agent.memory_provider import MemoryProvider
 from tools.registry import tool_error
 from .store import MemoryStore
+from .memorydb_postgresql import PostgreSQLMemoryStore
 from .retrieval import FactRetriever
 from hermes_cli.config import cfg_get
 
@@ -80,7 +89,6 @@ FACT_FEEDBACK_SCHEMA = {
         "This trains the memory — good facts rise, bad facts sink."
     ),
     "parameters": {
-        "type": "object",
         "properties": {
             "action": {"type": "string", "enum": ["helpful", "unhelpful"]},
             "fact_id": {"type": "integer", "description": "The fact ID to rate."},
@@ -113,7 +121,12 @@ def _load_plugin_config() -> dict:
 # ---------------------------------------------------------------------------
 
 class HolographicMemoryProvider(MemoryProvider):
-    """Holographic memory with structured facts, entity resolution, and HRR retrieval."""
+    """Holographic memory with structured facts, entity resolution, and HRR retrieval.
+
+    Supports two backends selected by the ``db_path`` config value:
+    * A local SQLite file path → :class:`MemoryStore` (original behaviour)
+    * The string ``"postgresql"`` → :class:`PostgreSQLMemoryStore` (shared PG)
+    """
 
     def __init__(self, config: dict | None = None):
         self._config = config or _load_plugin_config()
@@ -126,10 +139,9 @@ class HolographicMemoryProvider(MemoryProvider):
         return "holographic"
 
     def is_available(self) -> bool:
-        return True  # SQLite is always available, numpy is optional
+        return True
 
     def save_config(self, values, hermes_home):
-        """Write config to config.yaml under plugins.hermes-memory-store."""
         from pathlib import Path
         config_path = Path(hermes_home) / "config.yaml"
         try:
@@ -149,7 +161,7 @@ class HolographicMemoryProvider(MemoryProvider):
         from hermes_constants import display_hermes_home
         _default_db = f"{display_hermes_home()}/memory_store.db"
         return [
-            {"key": "db_path", "description": "SQLite database path", "default": _default_db},
+            {"key": "db_path", "description": "PostgreSQL (shared) or SQLite path", "default": _default_db},
             {"key": "auto_extract", "description": "Auto-extract facts at session end", "default": "false", "choices": ["true", "false"]},
             {"key": "default_trust", "description": "Default trust score for new facts", "default": "0.5"},
             {"key": "hrr_dim", "description": "HRR vector dimensions", "default": "1024"},
@@ -160,9 +172,6 @@ class HolographicMemoryProvider(MemoryProvider):
         _hermes_home = str(get_hermes_home())
         _default_db = _hermes_home + "/memory_store.db"
         db_path = self._config.get("db_path", _default_db)
-        # Expand $HERMES_HOME in user-supplied paths so config values like
-        # "$HERMES_HOME/memory_store.db" or "~/.hermes/memory_store.db" both
-        # resolve to the active profile's directory.
         if isinstance(db_path, str):
             db_path = db_path.replace("$HERMES_HOME", _hermes_home)
             db_path = db_path.replace("${HERMES_HOME}", _hermes_home)
@@ -171,7 +180,17 @@ class HolographicMemoryProvider(MemoryProvider):
         hrr_weight = float(self._config.get("hrr_weight", 0.3))
         temporal_decay = int(self._config.get("temporal_decay_half_life", 0))
 
-        self._store = MemoryStore(db_path=db_path, default_trust=default_trust, hrr_dim=hrr_dim)
+        # Select backend based on db_path
+        if str(db_path).strip().lower() == "postgresql":
+            logger.info("Holographic memory using PostgreSQL backend (shared PG)")
+            self._store = PostgreSQLMemoryStore(
+                db_path=db_path, default_trust=default_trust, hrr_dim=hrr_dim
+            )
+        else:
+            self._store = MemoryStore(
+                db_path=db_path, default_trust=default_trust, hrr_dim=hrr_dim
+            )
+
         self._retriever = FactRetriever(
             store=self._store,
             temporal_decay_half_life=temporal_decay,
@@ -184,9 +203,15 @@ class HolographicMemoryProvider(MemoryProvider):
         if not self._store:
             return ""
         try:
-            total = self._store._conn.execute(
-                "SELECT COUNT(*) FROM facts"
-            ).fetchone()[0]
+            # PG backend → holographic_facts; SQLite backend → facts
+            for tbl in ("holographic_facts", "facts"):
+                try:
+                    total = self._store._conn.execute(
+                        f"SELECT COUNT(*) AS cnt FROM {tbl}"
+                    ).fetchone()["cnt"]
+                    break
+                except Exception:
+                    total = 0
         except Exception:
             total = 0
         if total == 0:
@@ -220,8 +245,6 @@ class HolographicMemoryProvider(MemoryProvider):
             return ""
 
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
-        # Holographic memory stores explicit facts via tools, not auto-sync.
-        # The on_session_end hook handles auto-extraction if configured.
         pass
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
@@ -242,7 +265,6 @@ class HolographicMemoryProvider(MemoryProvider):
         self._auto_extract_facts(messages)
 
     def on_memory_write(self, action: str, target: str, content: str) -> None:
-        """Mirror built-in memory writes as facts."""
         if action == "add" and self._store and content:
             try:
                 category = "user_pref" if target == "user" else "general"
@@ -251,12 +273,6 @@ class HolographicMemoryProvider(MemoryProvider):
                 logger.debug("Holographic memory_write mirror failed: %s", e)
 
     def shutdown(self) -> None:
-        # Close the SQLite connection deterministically instead of leaking it
-        # to GC. MemoryStore opens its connection with check_same_thread=False
-        # (store.py), so without an explicit close() the sqlite3.Connection's
-        # fd is released by refcount/GC at a non-deterministic time on a
-        # non-deterministic thread, churning a DB fd through the kernel's free
-        # pool on every session teardown. close() already exists and is cheap.
         if self._store is not None:
             try:
                 self._store.close()
