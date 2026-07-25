@@ -28,6 +28,7 @@ from pathlib import Path
 from agent.memory_manager import sanitize_context
 from hermes_constants import get_hermes_home
 from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
+from abc import ABC, abstractmethod
 
 logger = logging.getLogger(__name__)
 
@@ -868,7 +869,340 @@ END;
 """
 
 
+class SessionDBProvider(ABC):
+    """Abstract base for pluggable session storage backends.
+
+    Follows the MemoryProvider pattern from agent/memory_provider.py.
+    Each provider implements the full SessionDB public interface.
+    """
+
+    # ── Lifecycle ────────────────────────────────────────────────────────
+
+    def initialize(self, **kwargs) -> None:
+        """Open connections, create schema, warm up caches.
+        Override in provider if needed — default is no-op."""
+
+    @abstractmethod
+    def close(self) -> None:
+        """Close connections, clean up resources."""
+
+    # ── Schema / maintenance ─────────────────────────────────────────────
+
+    @abstractmethod
+    def maybe_auto_prune_and_vacuum(self) -> bool: ...
+
+    @abstractmethod
+    def vacuum(self) -> int: ...
+
+    @abstractmethod
+    def optimize_fts(self) -> int: ...
+
+    # ── Session CRUD ────────────────────────────────────────────────────
+
+    @abstractmethod
+    def create_session(self, session_id: str, source: str, **kwargs) -> str: ...
+
+    @abstractmethod
+    def get_session(self, session_id: str) -> Optional[Dict[str, Any]]: ...
+
+    @abstractmethod
+    def end_session(self, session_id: str, end_reason: str) -> None: ...
+
+    @abstractmethod
+    def reopen_session(self, session_id: str) -> None: ...
+
+    @abstractmethod
+    def ensure_session(self, session_id: str, source: str, model: str = "", **kwargs) -> None: ...
+
+    @abstractmethod
+    def resolve_session_id(self, session_id_or_prefix: str) -> Optional[str]: ...
+
+    # ── Session metadata ────────────────────────────────────────────────
+
+    @abstractmethod
+    def set_session_title(self, session_id: str, title: str) -> bool: ...
+
+    @abstractmethod
+    def get_session_title(self, session_id: str) -> Optional[str]: ...
+
+    @abstractmethod
+    def get_session_by_title(self, title: str) -> Optional[Dict[str, Any]]: ...
+
+    @abstractmethod
+    def resolve_session_by_title(self, title: str) -> Optional[str]: ...
+
+    @abstractmethod
+    def set_session_archived(self, session_id: str, archived: bool) -> bool: ...
+
+    @abstractmethod
+    def update_system_prompt(self, session_id: str, system_prompt: str) -> None: ...
+
+    @abstractmethod
+    def update_session_model(self, session_id: str, model: str) -> None: ...
+
+    @abstractmethod
+    def update_session_billing_route(self, session_id: str, **kwargs) -> None: ...
+
+    @abstractmethod
+    def update_token_counts(self, session_id: str, **counts) -> None: ...
+
+    @abstractmethod
+    def update_session_cwd(self, session_id: str, cwd: str, **kwargs) -> None: ...
+
+    @abstractmethod
+    def update_session_meta(self, session_id: str, **kwargs) -> None: ...
+
+    @abstractmethod
+    def get_next_title_in_lineage(self, base_title: str) -> str: ...
+
+    @abstractmethod
+    def get_compression_tip(self, session_id: str) -> Optional[str]: ...
+
+    @abstractmethod
+    def get_compression_lineage(self, session_id: str) -> List[str]: ...
+
+    # ── Messages ────────────────────────────────────────────────────────
+
+    @abstractmethod
+    def append_message(self, session_id: str, role: str, content: str, **kwargs) -> int: ...
+
+    @abstractmethod
+    def replace_messages(self, session_id: str, messages: list) -> None: ...
+
+    @abstractmethod
+    def get_messages(self, session_id: str) -> list: ...
+
+    @abstractmethod
+    def get_messages_as_conversation(self, session_id: str, include_ancestors: bool = True) -> list: ...
+
+    @abstractmethod
+    def get_messages_around(self, session_id: str, before: int = 5, after: int = 5) -> dict: ...
+
+    @abstractmethod
+    def get_anchored_view(self, session_id: str, after_message_id: int, limit: int = 50) -> list: ...
+
+    @abstractmethod
+    def clear_messages(self, session_id: str) -> None: ...
+
+    @abstractmethod
+    def has_archived_messages(self, session_id: str) -> bool: ...
+
+    @abstractmethod
+    def archive_and_compact(self, session_id: str) -> Optional[str]: ...
+
+    @abstractmethod
+    def rewind_to_message(self, session_id: str, message_id: int) -> Dict[str, Any]: ...
+
+    @abstractmethod
+    def restore_rewound(self, session_id: str, since_message_id: int) -> int: ...
+
+    @abstractmethod
+    def resolve_resume_session_id(self, session_id: str) -> str: ...
+
+    @abstractmethod
+    def list_recent_user_messages(self, session_id: str, limit: int = 10) -> list: ...
+
+    # ── Search ──────────────────────────────────────────────────────────
+
+    @abstractmethod
+    def search_messages(self, query: str, **kwargs) -> List[Dict[str, Any]]: ...
+
+    @abstractmethod
+    def search_sessions(self, source: str = "", **kwargs) -> List[Dict[str, Any]]: ...
+
+    @abstractmethod
+    def search_sessions_by_id(self, query: str, **kwargs) -> List[Dict[str, Any]]: ...
+
+    @abstractmethod
+    def session_count(self, source: str = "") -> int: ...
+
+    @abstractmethod
+    def message_count(self, session_id: str = None) -> int: ...
+
+    # ── Session listing ─────────────────────────────────────────────────
+
+    @abstractmethod
+    def list_sessions_rich(self, source: str = "", **kwargs) -> List[Dict[str, Any]]: ...
+
+    @abstractmethod
+    def list_cron_job_runs(self, **kwargs) -> List[Dict[str, Any]]: ...
+
+    @abstractmethod
+    def distinct_session_cwds(self, include_archived: bool = False) -> List[Dict[str, Any]]: ...
+
+    @abstractmethod
+    def count_empty_sessions(self) -> int: ...
+
+    @abstractmethod
+    def delete_empty_sessions(self, **kwargs) -> int: ...
+
+    @abstractmethod
+    def delete_session(self, session_id: str, **kwargs) -> None: ...
+
+    @abstractmethod
+    def delete_session_if_empty(self, session_id: str) -> bool: ...
+
+    @abstractmethod
+    def delete_sessions(self, **kwargs) -> int: ...
+
+    @abstractmethod
+    def prune_sessions(self, **kwargs) -> int: ...
+
+    @abstractmethod
+    def archive_sessions(self, **kwargs) -> int: ...
+
+    @abstractmethod
+    def list_prune_candidates(self, **kwargs) -> List[Dict[str, Any]]: ...
+
+    # ── Export ──────────────────────────────────────────────────────────
+
+    @abstractmethod
+    def export_session(self, session_id: str) -> Optional[Dict[str, Any]]: ...
+
+    @abstractmethod
+    def export_session_lineage(self, session_id: str) -> Optional[Dict[str, Any]]: ...
+
+    @abstractmethod
+    def export_all(self, source: str = None) -> List[Dict[str, Any]]: ...
+
+    # ── Meta ────────────────────────────────────────────────────────────
+
+    @abstractmethod
+    def get_meta(self, key: str) -> Optional[str]: ...
+
+    @abstractmethod
+    def set_meta(self, key: str, value: str) -> None: ...
+
+    # ── Handoff ─────────────────────────────────────────────────────────
+
+    @abstractmethod
+    def request_handoff(self, session_id: str, platform: str) -> bool: ...
+
+    @abstractmethod
+    def get_handoff_state(self, session_id: str) -> Optional[Dict[str, Any]]: ...
+
+    @abstractmethod
+    def list_pending_handoffs(self) -> List[Dict[str, Any]]: ...
+
+    @abstractmethod
+    def claim_handoff(self, session_id: str) -> bool: ...
+
+    @abstractmethod
+    def complete_handoff(self, session_id: str) -> None: ...
+
+    @abstractmethod
+    def fail_handoff(self, session_id: str, error: str) -> None: ...
+
+    # ── Telegram topic mode (optional) ──────────────────────────────────
+
+    def apply_telegram_topic_migration(self) -> None: ...
+    def enable_telegram_topic_mode(self, **kwargs) -> None: ...
+    def disable_telegram_topic_mode(self, **kwargs) -> None: ...
+    def is_telegram_topic_mode_enabled(self, **kwargs) -> bool: ...
+    def get_telegram_topic_binding(self, **kwargs) -> Optional[str]: ...
+    def list_telegram_topic_bindings_for_chat(self, **kwargs) -> list: ...
+    def get_telegram_topic_binding_by_session(self, **kwargs) -> Optional[str]: ...
+    def delete_telegram_topic_binding(self, **kwargs) -> None: ...
+    def bind_telegram_topic(self, **kwargs) -> None: ...
+    def is_telegram_session_linked_to_topic(self, **kwargs) -> bool: ...
+    def list_unlinked_telegram_sessions_for_user(self, **kwargs) -> list: ...
+
+    # ── Compression locks ───────────────────────────────────────────────
+
+    @abstractmethod
+    def try_acquire_compression_lock(self, session_id: str, holder: str, ttl: int = 300) -> bool: ...
+
+    @abstractmethod
+    def release_compression_lock(self, session_id: str, holder: str) -> None: ...
+
+    @abstractmethod
+    def get_compression_lock_holder(self, session_id: str) -> Optional[str]: ...
+
+    @abstractmethod
+    def refresh_compression_lock(self, session_id: str, holder: str, ttl: int = 300) -> None: ...
+
+    @abstractmethod
+    def record_compression_failure_cooldown(self, session_id: str, error: str) -> None: ...
+
+    @abstractmethod
+    def get_compression_failure_cooldown(self, session_id: str) -> Optional[Dict[str, Any]]: ...
+
+    @abstractmethod
+    def clear_compression_failure_cooldown(self, session_id: str) -> None: ...
+
+    # ── Gateway-specific ────────────────────────────────────────────────
+
+    @abstractmethod
+    def record_gateway_session_peer(self, **kwargs) -> None: ...
+
+    @abstractmethod
+    def set_expiry_finalized(self, session_id: str, finalized: bool = True) -> None: ...
+
+    @abstractmethod
+    def save_gateway_routing_entry(self, **kwargs) -> None: ...
+
+    @abstractmethod
+    def replace_gateway_routing_entries(self, **kwargs) -> None: ...
+
+    @abstractmethod
+    def load_gateway_routing_entries(self, *, scope: str = "") -> Dict[str, str]: ...
+
+    @abstractmethod
+    def delete_gateway_routing_entries(self, **kwargs) -> None: ...
+
+    @abstractmethod
+    def list_gateway_sessions(self, **kwargs) -> list: ...
+
+    @abstractmethod
+    def find_session_by_origin(self, **kwargs) -> Optional[str]: ...
+
+    @abstractmethod
+    def find_latest_gateway_session_for_peer(self, **kwargs) -> Optional[str]: ...
+
+    @abstractmethod
+    def has_platform_message_id(self, session_id: str, platform_message_id: str) -> bool: ...
+
+    @abstractmethod
+    def prune_empty_ghost_sessions(self, sessions_dir: Optional[Path] = None) -> int: ...
+
+    @abstractmethod
+    def finalize_orphaned_compression_sessions(self) -> int: ...
+
+    @abstractmethod
+    def backfill_repo_roots(self, cwd_to_root: Dict[str, str]) -> None: ...
+
+
+def _resolve_sessiondb_provider():
+    """Read config and return the active provider class."""
+    try:
+        from hermes_cli.config import get_config_value
+        p = get_config_value("sessiondb.provider", "postgresql")
+        if p == "postgresql":
+            from sessiondb_postgresql import PostgreSQLSessionDB
+            return PostgreSQLSessionDB
+    except Exception:
+        pass
+    return SQLiteSessionDB
+
+
 class SessionDB:
+    """Session store — auto-selects the active provider based on config.
+
+    Default: PostgreSQL (``sessiondb_postgresql.PostgreSQLSessionDB``).
+    Set ``sessiondb.provider: sqlite`` in config to fall back to SQLite.
+
+    All existing call sites do ``SessionDB()`` unchanged — ``__new__``
+    returns the configured provider instance transparently.
+    """
+
+    def __new__(cls, *args, **kwargs):
+        if cls is SessionDB:
+            provider_cls = _resolve_sessiondb_provider()
+            return provider_cls(*args, **kwargs)
+        return super().__new__(cls)
+
+
+class SQLiteSessionDB(SessionDBProvider):
     """
     SQLite-backed session storage with FTS5 search.
 
@@ -6445,7 +6779,7 @@ class SessionDB:
 class AsyncSessionDB:
     """Async door onto SessionDB: offloads each call via asyncio.to_thread so a blocking SQLite call never freezes the event loop. Generic forwarder — the audit confirms no method returns a live cursor/generator."""
 
-    def __init__(self, db: "SessionDB") -> None:
+    def __init__(self, db: "SessionDBProvider") -> None:
         self._db = db
 
     def __getattr__(self, name: str):
