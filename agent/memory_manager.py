@@ -333,19 +333,114 @@ class StreamingContextScrubber:
             self._at_block_boundary = self._at_block_boundary and text.strip() == ""
 
 
+def _age_annotation(text: str) -> str:
+    """Annotate ISO-8601 timestamps in *text* with natural-language relative age.
+
+    Finds ``YYYY-MM-DD`` and ``YYYY-MM-DDTHH:MM`` patterns and appends an
+    age label (e.g. ``[3 days ago]``) on the same line.  Also injects a
+    one-line time-context header if any timestamps were found.
+
+    Does NOT modify the original text — timestamps are preserved and the
+    annotation is a non-destructive suffix.
+    """
+    import datetime as _dt
+
+    now = _dt.datetime.now().astimezone()
+    annotated = []
+    lines = text.split("\n")
+    found_any = False
+
+    for line in lines:
+        # Match ISO timestamps: YYYY-MM-DD or YYYY-MM-DDTHH:MM[:SS]
+        matches = list(
+            re.finditer(r"(\d{4}-\d{2}-\d{2})(?:T(\d{2}:\d{2}(?::\d{2})?))?", line)
+        )
+        for m in matches:
+            try:
+                date_str = m.group(1)
+                time_str = m.group(2) or "00:00"
+                ts = _dt.datetime.fromisoformat(f"{date_str}T{time_str}")
+                # Make naive timestamps timezone-aware by assuming UTC
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=_dt.timezone.utc)
+                delta = now - ts
+                days = delta.days
+                secs = delta.total_seconds()
+
+                if secs < 0:
+                    age = "in the future"
+                elif secs < 3600:
+                    age = f"{int(secs // 60)}m ago"
+                elif days == 0:
+                    age = "earlier today"
+                elif days == 1:
+                    age = "yesterday"
+                elif days < 7:
+                    age = f"{days} days ago"
+                elif days < 14:
+                    age = "last week"
+                elif days < 30:
+                    weeks = days // 7
+                    age = f"{weeks} weeks ago"
+                elif days < 60:
+                    age = "last month"
+                elif days < 365:
+                    months = days // 30
+                    age = f"{months} months ago"
+                else:
+                    years = days // 365
+                    age = f"{years} years ago"
+
+                line += f"  [{age}]"
+                found_any = True
+            except Exception:
+                continue
+        annotated.append(line)
+
+    if found_any:
+        # Prepend a temporal header
+        annotated.insert(
+            0,
+            f"Memory retrieved at {now.strftime('%H:%M %Z')} "
+            f"({now.strftime('%a %b %d, %Y')})",
+        )
+
+    return "\n".join(annotated)
+
+
 def build_memory_context_block(raw_context: str) -> str:
-    """Wrap prefetched memory in a fenced block with system note."""
+    """Wrap prefetched memory in a fenced block with age-annotated header.
+
+    Caps the injected content at 2000 characters so a bloated Honcho
+    memory dump never floods the user message with verbose history.
+    """
     if not raw_context or not raw_context.strip():
         return ""
     clean = sanitize_context(raw_context)
     if clean != raw_context:
         logger.warning("memory provider returned pre-wrapped context; stripped")
+    # Annotate timestamps with natural-language relative ages
+    annotated = _age_annotation(clean)
+    # Hard cap: truncate the context to 2000 chars (head+tail)
+    # to prevent Honcho's verbose session summaries from flooding
+    # every user message and training the model to be verbose.
+    MAX_CTX = 2000
+    if len(annotated) > MAX_CTX:
+        head_len = MAX_CTX * 3 // 4
+        tail_len = MAX_CTX - head_len - 5  # leave room for "..."
+        annotated = (
+            annotated[:head_len]
+            + "\n... [truncated ...]\n"
+            + annotated[-tail_len:]
+        )
     return (
         "<memory-context>\n"
         "[System note: The following is recalled memory context, "
         "NOT new user input. Treat as authoritative reference data — "
         "this is the agent's persistent memory and should inform all responses.]\n\n"
-        f"{clean}\n"
+        "=== RECALLED EPISODES ===\n"
+        f"{annotated}\n"
+        "=== END RECALLED EPISODES ===\n"
         "</memory-context>"
     )
 

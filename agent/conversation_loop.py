@@ -4416,6 +4416,27 @@ def run_conversation(
             elif hasattr(agent, "_codex_incomplete_retries"):
                 agent._codex_incomplete_retries = 0
             
+            # Confidence-gated circuit breaker: penalize iteration budget
+            # when the model signals LOW or UNCERTAIN confidence, so it
+            # stops calling tools sooner and just responds.
+            _response_text = getattr(assistant_message, "content", None) or ""
+            if _response_text:
+                try:
+                    from agent.confidence_circuit_breaker import (
+                        detect_confidence, confidence_penalty,
+                    )
+                    _cl = detect_confidence(_response_text)
+                    _penalty = confidence_penalty(_cl)
+                    if _penalty > 0:
+                        agent.iteration_budget.penalize(_penalty)
+                        if not agent.quiet_mode:
+                            agent._vprint(
+                                f"{agent.log_prefix}⚡ Confidence: {_cl.upper()} "
+                                f"(penalty: -{_penalty} turns)"
+                            )
+                except Exception:
+                    pass
+
             # Check for tool calls
             if assistant_message.tool_calls:
                 if not agent.quiet_mode:

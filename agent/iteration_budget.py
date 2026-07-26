@@ -48,6 +48,19 @@ class IterationBudget:
             if self._used > 0:
                 self._used -= 1
 
+    def penalize(self, amount: int = 1) -> None:
+        """Consume extra iterations as a confidence penalty.
+
+        Called when the model signals LOW or UNCERTAIN confidence.
+        Reduces the remaining budget so the model stops calling tools
+        sooner and just responds.  Thread-safe; clamped to not go below 0
+        remaining.
+        """
+        if amount <= 0:
+            return
+        with self._lock:
+            self._used = min(self.max_total, self._used + amount)
+
     @property
     def used(self) -> int:
         with self._lock:

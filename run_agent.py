@@ -1886,7 +1886,16 @@ class AIAgent:
                         for tc in msg.tool_calls
                     ]
                 elif isinstance(msg.get("tool_calls"), list):
-                    tool_calls_data = msg["tool_calls"]
+                    raw = msg["tool_calls"]
+                    # Normalize: promote string items to dicts so stored JSON
+                    # is always a list of dicts, never a list of raw strings
+                    # that would crash downstream iteration.
+                    tool_calls_data = [
+                        tc if isinstance(tc, dict)
+                        else {"id": str(tc), "type": "function",
+                              "function": {"name": str(tc), "arguments": "{}"}}
+                        for tc in raw
+                    ]
                 self._session_db.append_message(
                     session_id=self.session_id,
                     role=role,
@@ -5785,7 +5794,7 @@ class AIAgent:
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
         from agent.conversation_loop import run_conversation
-        return run_conversation(
+        _result = run_conversation(
             self,
             user_message,
             system_message,
@@ -5796,6 +5805,13 @@ class AIAgent:
             persist_user_timestamp=persist_user_timestamp,
             moa_config=moa_config,
         )
+        # Log this turn for post-hoc analysis (non-blocking)
+        try:
+            from agent.response_logger import log_turn
+            log_turn(self, user_message, _result)
+        except Exception:
+            pass
+        return _result
 
     def chat(self, message: str, stream_callback: Optional[callable] = None) -> str:
         """

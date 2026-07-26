@@ -1311,7 +1311,10 @@ class TelegramAdapter(BasePlatformAdapter):
         :meth:`_is_rich_fallback_error` classifies as permanent so the send
         degrades to the legacy chunking path.
         """
-        return len(content) <= self.RICH_MESSAGE_MAX_CHARS
+        return len(content) <= min(
+            self.RICH_MESSAGE_MAX_CHARS,
+            self.MAX_MESSAGE_LENGTH - 200,
+        )
 
     def _bot_supports_rich(self) -> bool:
         """True when the bound bot can issue raw ``sendRichMessage`` calls.
@@ -1728,10 +1731,9 @@ class TelegramAdapter(BasePlatformAdapter):
         if getattr(self, "_disable_link_previews", False):
             payload["link_preview_options"] = {"is_disabled": True}
         try:
-            # Raw Bot API result; do not request return_type=Message (PTB does
-            # not fully model the 10.1 response shape yet — a post-edit parse
-            # error must not be mistaken for a failed edit).
-            await self._bot.do_api_request("editMessageText", api_kwargs=payload)
+            # Use PTB's native editMessageText instead of the deprecated
+            # do_api_request("editMessageText", ...) path.
+            await self._bot.editMessageText(**payload)
         except Exception as exc:
             if self._is_rich_fallback_error(exc):
                 if self._is_rich_capability_error(exc):
@@ -3585,21 +3587,41 @@ class TelegramAdapter(BasePlatformAdapter):
                                 pass  # Typing failures are non-fatal
                     return rich_result
 
-            # Format and split message if needed
-            formatted = self.format_message(content)
-            chunks = self.truncate_message(
-                formatted, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len,
-            )
-            if len(chunks) > 1:
-                # truncate_message appends a raw " (1/2)" suffix. Escape the
-                # MarkdownV2-special parentheses so Telegram doesn't reject the
-                # chunk and fall back to plain text.
-                chunks = [
-                    _separate_chunk_indicator_from_fence(
-                        re.sub(r" \((\d+)/(\d+)\)$", r" \\(\1/\2\\)", chunk)
-                    )
-                    for chunk in chunks
-                ]
+            # Format and split message if needed.
+            # Use paragraph-aware bubble splitting (preserves code fences,
+            # splits at paragraph boundaries) instead of naive character splits.
+            _splitter_ok = False
+            try:
+                from agent.bubble_splitter import split_bubbles
+                _raw_chunks, _oversized = split_bubbles(
+                    content, max_chars=self.MAX_MESSAGE_LENGTH - 200,
+                )
+                if _oversized:
+                    try:
+                        await self.send_document(
+                            chat_id, _oversized,
+                            reply_to=reply_to, metadata=metadata,
+                        )
+                    except Exception:
+                        pass
+                if _raw_chunks:
+                    chunks = [self.format_message(c) for c in _raw_chunks]
+                    _splitter_ok = True
+            except Exception:
+                pass
+
+            if not _splitter_ok:
+                formatted = self.format_message(content)
+                chunks = self.truncate_message(
+                    formatted, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len,
+                )
+                if len(chunks) > 1:
+                    chunks = [
+                        _separate_chunk_indicator_from_fence(
+                            re.sub(r" \((\d+)/(\d+)\)$", r" \\(\1/\2\\)", chunk)
+                        )
+                        for chunk in chunks
+                    ]
             
             message_ids = []
             thread_id = self._metadata_thread_id(metadata)

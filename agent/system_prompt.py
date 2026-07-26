@@ -28,6 +28,9 @@ import os
 from typing import Any, Dict, List, Optional
 
 from agent.prompt_builder import (
+    ACTIVE_CONTEXT_GUIDANCE,
+    BACKREF_GUIDANCE,
+    CURIOSITY_GUIDANCE,
     DEFAULT_AGENT_IDENTITY,
     GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
     HERMES_AGENT_HELP_GUIDANCE,
@@ -41,6 +44,7 @@ from agent.prompt_builder import (
     SKILLS_GUIDANCE,
     STEER_CHANNEL_NOTE,
     TASK_COMPLETION_GUIDANCE,
+    TONE_MIRROR_GUIDANCE,
     TOOL_USE_ENFORCEMENT_GUIDANCE,
     TOOL_USE_ENFORCEMENT_MODELS,
     drain_truncation_warnings,
@@ -215,6 +219,12 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # Language-matching rule — unconditional, stable tier. Overrides ambient cues.
     stable_parts.append(LANGUAGE_MATCH_GUIDANCE)
 
+    # Tone-mirroring guidance — formality, energy, slang matching. Works
+    # alongside LANGUAGE_MATCH_GUIDANCE (language) to provide full register
+    # awareness. Static directive — the model reads tone from its own
+    # conversation history, no runtime tracking needed.
+    stable_parts.append(TONE_MIRROR_GUIDANCE)
+
     # Universal task-completion / no-fabrication guidance.  Applied to ALL
     # models regardless of tool_use_enforcement gating — the failure modes
     # this targets (stopping after a stub; fabricating output when a real
@@ -253,8 +263,29 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     elif _kanban_guidance is None and "kanban_show" in agent.valid_tool_names:
         # Fallback for code paths that bypass agent_init (rare).
         tool_guidance.append(KANBAN_GUIDANCE)
+    tool_guidance.append(BACKREF_GUIDANCE)
+    tool_guidance.append(ACTIVE_CONTEXT_GUIDANCE)
+    tool_guidance.append(CURIOSITY_GUIDANCE)
     if tool_guidance:
         stable_parts.append(" ".join(tool_guidance))
+
+    # Verbosity instruction — scales conciseness from ultra-terse to detailed
+    _verbosity = getattr(agent, "_verbosity", 0.5)
+    if _verbosity <= 0.3:
+        stable_parts.append(
+            "<verbosity>\n"
+            "Be ultra-concise. Respond in 1–2 short sentences. "
+            "Skip all narration. Just give the answer.\n"
+            "</verbosity>"
+        )
+    elif _verbosity <= 0.6:
+        stable_parts.append(
+            "<verbosity>\n"
+            "Be concise. Prefer short paragraphs over long explanations. "
+            "Use markers like [checking] instead of full sentences.\n"
+            "</verbosity>"
+        )
+    # ≥0.7: no verbosity constraint — model defaults to its natural verbosity
 
     # Steering only lands inside tool results, so it's only reachable when the
     # agent has tools. Static text → byte-stable prompt (no cache hit).
@@ -302,10 +333,11 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
                 stable_parts.append(GOOGLE_MODEL_OPERATIONAL_GUIDANCE)
             # OpenAI GPT/Codex execution discipline (tool persistence,
             # prerequisite checks, verification, anti-hallucination).
-            # Also applied to xAI Grok — same failure modes (claims completion
-            # without tool calls, suggests workarounds instead of using
-            # existing tools, replies with plans instead of executing).
-            if "gpt" in _model_lower or "codex" in _model_lower or "grok" in _model_lower:
+            # Also applied to xAI Grok and DeepSeek — same failure modes
+            # (claims completion without tool calls, suggests workarounds
+            # instead of using existing tools, replies with plans instead
+            # of executing, or fabricates results when blocked).
+            if "gpt" in _model_lower or "codex" in _model_lower or "grok" in _model_lower or "deepseek" in _model_lower:
                 stable_parts.append(OPENAI_MODEL_EXECUTION_GUIDANCE)
 
     has_skills_tools = any(name in agent.valid_tool_names for name in ['skills_list', 'skill_view', 'skill_manage'])
@@ -519,6 +551,23 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # exact wall-clock time via tools when it actually needs it.
     # Credit: @iamfoz (PR #20451).
     timestamp_line = f"Conversation started: {now.strftime('%A, %B %d, %Y')}"
+    # Temporal context — helps the model adapt its register to time of day.
+    # Uses hour-precision only so the prompt stays byte-stable within a given hour
+    # (prefix-cache friendly) while still informing late-night vs working-hours
+    # register choice. The model can query exact wall-clock time via tools when
+    # it needs sub-hour precision.
+    _hour = now.hour
+    if _hour < 6:
+        _time_period = "late night/early morning (deep focus mode \u2014 be extra concise)"
+    elif _hour < 12:
+        _time_period = "morning (regular mode)"
+    elif _hour < 18:
+        _time_period = "afternoon/working hours (exploratory mode)"
+    elif _hour < 22:
+        _time_period = "evening (relaxed mode)"
+    else:
+        _time_period = "late night (deep focus mode \u2014 be extra concise)"
+    timestamp_line += f"\nTime: {now.strftime('%H:00')} ({_time_period})"
     if agent.pass_session_id and agent.session_id:
         timestamp_line += f"\nSession ID: {agent.session_id}"
     if agent.model:

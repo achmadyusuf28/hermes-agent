@@ -1225,6 +1225,15 @@ class HonchoMemoryProvider(MemoryProvider):
             self._start_session_init_background()
             return
 
+        # Salience triage: drop SENSORY turns (processing signals, short
+        # acknowledgments, check-ins). Only EPISODIC and SEMANTIC persist.
+        try:
+            from agent.salience_triage import is_noteworthy
+            if not is_noteworthy(user_content or ''):
+                return
+        except Exception:
+            pass
+
         msg_limit = self._config.message_max_chars if self._config else 25000
         clean_user_content = sanitize_context(user_content or "").strip()
         clean_assistant_content = sanitize_context(assistant_content or "").strip()
