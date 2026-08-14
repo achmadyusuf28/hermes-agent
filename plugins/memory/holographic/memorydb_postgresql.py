@@ -52,6 +52,14 @@ CREATE TABLE IF NOT EXISTS holographic_facts (
     helpful_count   INTEGER DEFAULT 0,
     created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    -- Phase A1: provenance + lifecycle (three-layer memory design).
+    -- Absent on legacy rows until the additive migration runs; NULL == unknown.
+    source          TEXT,                            -- 'user-correction'|'session'|'self-derived'|'dogfood'|'legacy'
+    session_id      TEXT,                            -- link to state.db session for raw capture
+    importance      INTEGER DEFAULT 5,               -- 1..10; drives importance decay (tier judgment)
+    superseded_by   INTEGER REFERENCES holographic_facts(fact_id),  -- logical soft-delete (self-FK)
+    decay_exempt    BOOLEAN DEFAULT FALSE,           -- tier-1 (behavior-gating/preference) never decays
+    last_used_at    TIMESTAMP,                       -- bumped on recall hit to reset decay
     hrr_vector      BYTEA,
     search_vector   TSVECTOR
 );
@@ -208,21 +216,44 @@ class PostgreSQLMemoryStore:
         content: str,
         category: str = "general",
         tags: str = "",
+        source: str = None,
+        session_id: str = None,
+        importance: int = 5,
+        decay_exempt: bool = False,
+        trust_score: float = None,
     ) -> int:
-        """Insert a fact and return its fact_id. Deduplicates by content."""
+        """Insert a fact and return its fact_id. Deduplicates by content.
+
+        Phase A1 additions (all optional, backward-compatible):
+        ``source`` / ``session_id`` record provenance; ``importance`` (1..10)
+        and ``decay_exempt`` feed the dreaming sweep's tier judgment. If a
+        fact with the same content already exists, return its id and — for an
+        existing legacy row missing provenance — backfill the new metadata.
+        """
         content = content.strip()
         if not content:
             raise ValueError("content must not be empty")
+
+        # Clamp importance into 1..10
+        try:
+            importance = max(1, min(10, int(importance)))
+        except (TypeError, ValueError):
+            importance = 5
 
         with self._lock:
             try:
                 with self._conn.cursor() as cur:
                     cur.execute(
                         """INSERT INTO holographic_facts
-                           (content, category, tags, trust_score)
-                           VALUES (%s, %s, %s, %s)
+                           (content, category, tags, trust_score,
+                            source, session_id, importance, decay_exempt)
+                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                            RETURNING fact_id""",
-                        (content, category, tags, self.default_trust),
+                        (
+                            content, category, tags,
+                            self.default_trust if trust_score is None else _clamp_trust(trust_score),
+                            source, session_id, importance, bool(decay_exempt),
+                        ),
                     )
                     fact_id = cur.fetchone()["fact_id"]
                 self._conn.commit()
@@ -230,11 +261,24 @@ class PostgreSQLMemoryStore:
                 self._conn.rollback()
                 with self._conn.cursor() as cur:
                     cur.execute(
-                        "SELECT fact_id FROM holographic_facts WHERE content = %s",
+                        "SELECT fact_id, source FROM holographic_facts WHERE content = %s",
                         (content,),
                     )
                     row = cur.fetchone()
-                    return int(row["fact_id"]) if row else 0
+                    if not row:
+                        return 0
+                    fact_id = int(row["fact_id"])
+                    # Backfill provenance on an existing legacy row that lacks it.
+                    if row["source"] is None and (source or session_id):
+                        cur.execute(
+                            """UPDATE holographic_facts
+                               SET source = %s, session_id = %s,
+                                   importance = %s, decay_exempt = %s
+                               WHERE fact_id = %s""",
+                            (source, session_id, importance, bool(decay_exempt), fact_id),
+                        )
+                        self._conn.commit()
+                return fact_id
 
             # Entity extraction
             for name in self._extract_entities(content):
@@ -267,6 +311,7 @@ class PostgreSQLMemoryStore:
             if category is not None:
                 cat_clause = "AND category = %s"
                 params.append(category)
+            params.append(query)   # 3rd placeholder: ts_rank uses the query again
             params.append(limit)
 
             with self._conn.cursor() as cur:
@@ -356,6 +401,46 @@ class PostgreSQLMemoryStore:
             cat = category or row["category"]
             self._rebuild_bank(cat)
             return True
+
+    def supersede_fact(self, fact_id: int, replacement_id: int) -> bool:
+        """Logically soft-delete a fact by pointing ``superseded_by`` at its
+        replacement. The original row is never physically removed — it stays
+        append-only and recoverable (Phase A1 three-layer design).
+
+        Returns True if ``fact_id`` existed and was marked superseded.
+        """
+        with self._lock:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "SELECT 1 FROM holographic_facts WHERE fact_id = %s",
+                    (fact_id,),
+                )
+                if cur.fetchone() is None:
+                    return False
+                cur.execute(
+                    "UPDATE holographic_facts SET superseded_by = %s, "
+                    "updated_at = CURRENT_TIMESTAMP WHERE fact_id = %s "
+                    "AND superseded_by IS NULL",
+                    (replacement_id, fact_id),
+                )
+            self._conn.commit()
+            return True
+
+    def touch_used(self, fact_id: int) -> None:
+        """Bump ``last_used_at`` on a recall hit (resets importance decay).
+        Non-fatal if the column isn't present yet (pre-migration rows)."""
+        with self._lock:
+            try:
+                with self._conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE holographic_facts SET last_used_at = CURRENT_TIMESTAMP "
+                        "WHERE fact_id = %s",
+                        (fact_id,),
+                    )
+                self._conn.commit()
+            except psycopg2.errors.UndefinedColumn:
+                # Old schema (pre Phase A1) — last_used_at not yet added.
+                self._conn.rollback()
 
     def remove_fact(self, fact_id: int) -> bool:
         """Delete a fact and its entity links. Returns True if row existed."""

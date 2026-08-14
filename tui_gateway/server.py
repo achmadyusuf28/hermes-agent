@@ -4911,6 +4911,8 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
         content_text = _coerce_message_text(m.get("content"))
         if role == "assistant" and m.get("tool_calls"):
             for tc in m["tool_calls"]:
+                if not isinstance(tc, dict):
+                    continue
                 fn = tc.get("function", {})
                 tc_id = tc.get("id", "")
                 if tc_id and fn.get("name"):

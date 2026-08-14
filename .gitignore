@@ -70,6 +70,11 @@ apps/desktop/build/
 apps/desktop/dist/
 apps/desktop/release/
 apps/desktop/*.tsbuildinfo
+# Colocated esbuild/vite output emitted next to TS sources (index.js beside
+# index.tsx). apps/*/src carries no hand-authored .js, so excluding it never
+# drops real source.
+apps/*/src/**/*.js
+apps/*/src/**/*.js.map
 
 # Web UI assets — synced from @nous-research/ui at build time via
 # `npm run sync-assets` (see web/package.json).
@@ -144,3 +149,4 @@ apps/desktop/demo/
 # PR body is the archive. See the hermes-agent-dev skill's
 # pr-infographic-workflow reference (storage rule + lapse #8 / #COMMIT-1).
 infographic/
+sessiondb_postgresql.py

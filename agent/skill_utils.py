@@ -824,12 +824,27 @@ _NIX_SKILL_PIPELINE_RE = re.compile(r'pipeline\s*=\s*\[(.*?)\]', re.DOTALL)
 _NIX_SKILL_SEVERITY_RE = re.compile(r'severity\s*=\s*"([^"]+)"')
 _NIX_SKILL_REMEDIATE_RE = re.compile(r'remediate\s*=\s*\{(.*?)\}', re.DOTALL)
 _NIX_ATTR_ASSIGN_RE = re.compile(r'(\S+)\s*=\s*"([^"]+)"')
-_NIX_SKILL_CHECK_RE = re.compile(r'check\s*=\s*(".*?")', re.DOTALL)
+_NIX_SKILL_CHECK_RE = re.compile(r"check\s*=\s*(?:\"(.*?)\"|''\n(.*?)''\s*);", re.DOTALL)
 _NIX_SKILL_CHECK_INTERVAL_RE = re.compile(r'check_interval\s*=\s*"([^"]+)"')
 _NIX_SKILL_VERSION_RE = re.compile(r'version\s*=\s*(\d+)')
 _NIX_SKILL_STATUS_RE = re.compile(r'status\s*=\s*"([^"]+)"')
 _NIX_SKILL_CHANGELOG_RE = re.compile(r'changelog\s*=\s*\[(.*?)\]', re.DOTALL)
 _NIX_SKILL_AUTHOR_RE = re.compile(r'author\s*=\s*"([^"]*)"')
+_NIX_SKILL_TWIN_RE = re.compile(r'twin\s*=\s*"([^"]*)"')
+# ── Gap-6 carriage fields: platforms / environments / references list / metadata ──
+# These preserve markdown frontmatter through md→Nix conversion so nothing is
+# dropped. They are CARRIED (read + emitted), not necessarily acted upon: Nix-side
+# gating parity is gap 3 (separate). Lists use Nix `[ "a" "b" ]` literals.
+_NIX_SKILL_PLATFORMS_RE = re.compile(r'platforms\s*=\s*\[(.*?)\]', re.DOTALL)
+_NIX_SKILL_ENVIRONMENTS_RE = re.compile(r'environments\s*=\s*\[(.*?)\]', re.DOTALL)
+_NIX_SKILL_REFERENCES_RE = re.compile(r'references\s*=\s*\[(.*?)\]', re.DOTALL)
+# metadata is a nested attrset, e.g. `metadata = { hermes = { tags = [...]; }; };`.
+# Capture to the matching close brace (non-greedy, DOTALL).
+_NIX_SKILL_METADATA_RE = re.compile(r'metadata\s*=\s*\{(.*?)\}', re.DOTALL)
+# within a metadata/attrset block: `key = value;` — value is a Nix list or string.
+_NIX_ATTR_INNER_ASSIGN_RE = re.compile(r'(\S+)\s*=\s*(\[(?:.*?)\]|"(?:.*?)")\s*;', re.DOTALL)
+# a `tags = [ "a" "b" ];` or `related_skills = [ ... ];` list, and a bare string.
+_NIX_ATTR_INNER_LIST_RE = re.compile(r'\[(.*?)\]', re.DOTALL)
 
 
 def _extract_nix_string_list(text: str) -> list[str]:
@@ -958,7 +973,7 @@ def parse_nix_skill(path: Path) -> Dict[str, Any]:
     check = None
     ck_match = _NIX_SKILL_CHECK_RE.search(content)
     if ck_match:
-        check = ck_match.group(1).strip().strip('"')
+        check = (ck_match.group(1) or ck_match.group(2) or "").strip().strip('"')
         if not check:
             check = None
 
@@ -988,6 +1003,96 @@ def parse_nix_skill(path: Path) -> Dict[str, Any]:
     if au_match:
         author = au_match.group(1)
 
+    # Twin = name of the markdown skill this Nix module replaces (side-by-side
+    # migration provenance). Empty for native/edit-only Nix skills.
+    twin = ""
+    tw_match = _NIX_SKILL_TWIN_RE.search(content)
+    if tw_match:
+        twin = tw_match.group(1)
+
+    # ── Gap-6 carriage: platforms / environments / references / metadata ──
+    platforms = []
+    pf_match = _NIX_SKILL_PLATFORMS_RE.search(content)
+    if pf_match:
+        platforms = _extract_nix_string_list(pf_match.group(1))
+
+    environments = []
+    env_match = _NIX_SKILL_ENVIRONMENTS_RE.search(content)
+    if env_match:
+        environments = _extract_nix_string_list(env_match.group(1))
+
+    references = []
+    ref_match = _NIX_SKILL_REFERENCES_RE.search(content)
+    if ref_match:
+        references = _extract_nix_string_list(ref_match.group(1))
+
+    metadata = {}
+    md_match = _NIX_SKILL_METADATA_RE.search(content)
+    if md_match:
+        # `inner` captured by the non-greedy `(.*?)\}` stops at the FIRST `}`
+        # (the innermost brace), so for nested attrsets it cuts mid-structure.
+        # Re-scan from the opening brace with a brace-balanced read to get the
+        # full `metadata = { ... };` body reliably regardless of nesting depth.
+        open_idx = content.find("metadata")
+        open_idx = content.find("{", open_idx) if open_idx != -1 else -1
+        if open_idx != -1:
+            balance = 0
+            i = open_idx
+            brace_open = None
+            # find the first `{` that starts the metadata attrset
+            while i < len(content):
+                c = content[i]
+                if c == "{":
+                    if brace_open is None:
+                        brace_open = i
+                        balance = 1
+                    else:
+                        balance += 1
+                elif c == "}":
+                    balance -= 1
+                    if balance == 0:
+                        body = content[open_idx:i + 1]
+                        break
+                i += 1
+            else:
+                body = ""
+            if body:
+                # body now = `{ hermes = { tags = [...]; ... }; };` — parse nested
+                # string->attrset blocks with a balanced helper.
+                def _balanced_blocks(body_text):
+                    blocks = []
+                    j = 0
+                    while True:
+                        key_m = re.search(r'(\S+)\s*=\s*\{', body_text[j:])
+                        if not key_m:
+                            break
+                        key = key_m.group(1)
+                        start = j + key_m.start() + body_text[j + key_m.start():].index("{")
+                        bal = 1
+                        k = start + 1
+                        while k < len(body_text) and bal:
+                            if body_text[k] == "{":
+                                bal += 1
+                            elif body_text[k] == "}":
+                                bal -= 1
+                            k += 1
+                        blocks.append((key, body_text[start + 1:k - 1]))
+                        j = k
+                    return blocks
+
+                for key, sub in _balanced_blocks(body):
+                    meta_block = {}
+                    for prop_m in _NIX_ATTR_INNER_ASSIGN_RE.finditer(sub):
+                        pkey = prop_m.group(1)
+                        pval = prop_m.group(2)
+                        if pval.startswith("["):
+                            items = _extract_nix_string_list(pval)
+                            meta_block[pkey] = items
+                        else:
+                            meta_block[pkey] = pval.strip().strip('"')
+                    if meta_block:
+                        metadata[key] = meta_block
+
     return {
         "name": name,
         "description": description,
@@ -1009,6 +1114,11 @@ def parse_nix_skill(path: Path) -> Dict[str, Any]:
         "status": status,
         "changelog": changelog,
         "author": author,
+        "twin": twin,
+        "platforms": platforms,
+        "environments": environments,
+        "references": references,
+        "metadata": metadata,
     }
 
 

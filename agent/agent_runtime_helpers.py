@@ -2407,6 +2407,17 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
     is present — so orphans from session loading or manual message
     manipulation are always caught.
     """
+    # --- Drop non-dict messages (e.g. strings that leaked into the list) ---
+    # Strict Rust-based APIs (opencode-go) reject non-object message elements
+    # with deserialization errors like "expected struct RequestMessageToolCall".
+    pre_len = len(messages)
+    messages = [m for m in messages if isinstance(m, dict)]
+    if len(messages) != pre_len:
+        _ra().logger.warning(
+            "Pre-call sanitizer: dropped %d non-dict message(s) from API payload",
+            pre_len - len(messages),
+        )
+
     # --- Role allowlist: drop messages with roles the API won't accept ---
     filtered = []
     for msg in messages:
@@ -2446,6 +2457,23 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
         ):
             msg = {k: v for k, v in msg.items() if k != "tool_calls"}
             dropped_empty_tool_calls += 1
+        elif (
+            isinstance(msg, dict)
+            and msg.get("role") == "assistant"
+            and isinstance(msg.get("tool_calls"), list)
+        ):
+            # Drop individual tool_calls with empty IDs — the API cannot
+            # correlate them with tool results and rejects with 400.
+            kept = [
+                tc for tc in msg["tool_calls"]
+                if isinstance(tc, dict) and tc.get("id", "").strip()
+            ]
+            if len(kept) != len(msg["tool_calls"]):
+                if kept:
+                    msg = {**msg, "tool_calls": kept}
+                else:
+                    msg = {k: v for k, v in msg.items() if k != "tool_calls"}
+                dropped_empty_tool_calls += 1
         normalized.append(msg)
     if dropped_empty_tool_calls:
         messages = normalized

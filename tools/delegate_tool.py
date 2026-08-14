@@ -270,6 +270,90 @@ def _extract_output_tail(
     return tail
 
 
+# Tool results that carry verifiable evidence worth persisting into the child
+# tool_trace. For these, we record a bounded ``output_head`` (first N chars of
+# the tool result) so the parent can confirm *what* the child actually saw,
+# not just how many bytes came back. Tools outside this whitelist are skipped —
+# e.g. image_generate / text_to_speech return binary or media payloads with no
+# verification value.
+_EVIDENCE_TOOLS = frozenset(
+    {
+        "search_files",
+        "read_file",
+        "write_file",
+        "patch",
+        "terminal",
+        "web_extract",
+        "web_search",
+    }
+)
+
+# Hard cap on captured tool-result evidence. Keep it small enough that the
+# trace stays cheap even for chatty terminal output. Cross-node Option A will
+# consume this to validate remote one-shots, so prefer recent/searched lines.
+_OUTPUT_HEAD_MAX = 250
+
+
+def _capture_output_head(content: Any, limit: int = _OUTPUT_HEAD_MAX) -> str:
+    """Return a bounded, redaction-aware leading slice of tool-result content.
+
+    The result is guaranteed <= ``limit`` chars and is run through the global
+    secret redactor so no credential the child saw leaks into the parent trace.
+    """
+    text = _stringify_tool_content(content)
+    if not text:
+        return ""
+    head = text[:limit]
+    # Redact after slicing — forces the redactor to run on a small string, and
+    # any secret longer than `limit` chars is already out of scope by the slice.
+    try:
+        from agent.redact import redact_sensitive_text
+
+        return redact_sensitive_text(head, force=True)
+    except Exception:  # pragma: no cover - redaction must never break the trace
+        return head
+
+
+def _redact_tool_args(tool_name: str, arguments: str) -> Dict[str, Any]:
+    """Parse + redact a tool call's arguments into a compact dict for evidence.
+
+    Returns an empty dict when the arguments are not valid JSON (some tool
+    descriptions pass non-JSON argument blobs), so the trace never carries a
+    giant raw string. Sensitive field values (API keys, tokens) are masked.
+    """
+    try:
+        parsed = json.loads(arguments)
+        if not isinstance(parsed, dict):
+            return {}
+    except (json.JSONDecodeError, TypeError):
+        return {}
+
+    try:
+        from agent.redact import redact_sensitive_text
+
+        out: Dict[str, Any] = {}
+        for k, v in list(parsed.items())[:16]:  # bound key count for large schemas
+            if isinstance(v, str):
+                # Redact the serialized `key: value` pair, NOT the bare value —
+                # the redactor's JSON-field pattern fires on key names like
+                # "api_key"/"token", so a bare value passed alone would slip
+                # through its key-based regexes.
+                pair = json.dumps({k: v}, ensure_ascii=False)
+                masked = redact_sensitive_text(pair, force=True)
+                if masked.startswith("{"):
+                    try:
+                        out[k] = json.loads(masked)[k]
+                    except Exception:
+                        out[k] = masked
+                else:
+                    out[k] = masked
+            else:
+                out[k] = v
+        return out
+    except Exception:  # pragma: no cover - redaction must never break trace
+        return parsed
+
+
 def _stringify_tool_content(content: Any) -> str:
     """Return a stable text representation for tool-result content.
 
@@ -2179,9 +2263,12 @@ def _run_single_child(
                 if msg.get("role") == "assistant":
                     for tc in msg.get("tool_calls") or []:
                         fn = tc.get("function", {})
+                        tool_name = fn.get("name", "unknown")
+                        args_str = fn.get("arguments", "")
                         entry_t = {
-                            "tool": fn.get("name", "unknown"),
-                            "args_bytes": len(fn.get("arguments", "")),
+                            "tool": tool_name,
+                            "args_bytes": len(args_str),
+                            "args": _redact_tool_args(tool_name, args_str),
                         }
                         tool_trace.append(entry_t)
                         tc_id = tc.get("id")
@@ -2194,9 +2281,20 @@ def _run_single_child(
                         "result_bytes": len(content),
                         "status": "error" if is_error else "ok",
                     }
-                    # Match by tool_call_id for parallel calls
+                    # Match by tool_call_id for parallel calls, falling back to
+                    # the trailing entry when there's no id.
                     tc_id = msg.get("tool_call_id")
                     target = trace_by_id.get(tc_id) if tc_id else None
+                    evidence_tool = (
+                        target.get("tool")
+                        if target is not None
+                        else (tool_trace[-1].get("tool") if tool_trace else None)
+                    )
+                    # Bounded evidence for verification (Touch 0): capture a
+                    # leading slice of the result for evidence-bearing tools, so
+                    # the parent can see *what* the child saw, not just bytes.
+                    if evidence_tool in _EVIDENCE_TOOLS:
+                        result_meta["output_head"] = _capture_output_head(content)
                     if target is not None:
                         target.update(result_meta)
                     elif tool_trace:

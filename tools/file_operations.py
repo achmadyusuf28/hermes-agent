@@ -1474,10 +1474,48 @@ class ShellFileOperations(FileOperations):
         dirs_created = False
 
         if parent:
-            mkdir_cmd = f"mkdir -p {self._escape_shell_arg(parent)}"
+            q_parent = self._escape_shell_arg(parent)
+
+            # ── Group-writability inheritance ────────────────────────────
+            # Find the deepest existing ancestor of the target directory
+            # BEFORE mkdir -p creates anything.  If that ancestor is
+            # group-writable, we remember its path so that after mkdir -p
+            # we can walk back down and ``chmod g+rwx`` the newly created
+            # directories — making group-writability propagate naturally
+            # through fresh directory trees in shared workspaces like
+            # ``/mnt/data/``.
+            # Best-effort: failures are silently ignored.
+            find_anc_cmd = (
+                f"_anc={q_parent}; "
+                'while [ ! -d "$_anc" ] && [ "$_anc" != "/" ]; do '
+                '  _anc=$(dirname "$_anc"); '
+                'done; '
+                'if [ -d "$_anc" ]; then '
+                f'  _m=$(stat -c%a "$_anc" 2>/dev/null || stat -f%Lp "$_anc" 2>/dev/null || echo 0); '
+                '  if [ -n "$_m" ] && [ $((0$_m & 0020)) -ne 0 ]; then '
+                '    echo "$_anc"; '
+                '  fi; '
+                'fi'
+            )
+            anc_result = self._exec(find_anc_cmd)
+
+            mkdir_cmd = f"mkdir -p {q_parent}"
             mkdir_result = self._exec(mkdir_cmd)
             if mkdir_result.exit_code == 0:
                 dirs_created = True
+
+            # If we found a group-writable ancestor, chmod new dirs
+            if anc_result.exit_code == 0 and anc_result.stdout.strip():
+                _gw_anc = anc_result.stdout.strip().split('\n')[0]
+                q_gw_anc = self._escape_shell_arg(_gw_anc)
+                chmod_dirs_cmd = (
+                    f'_p={q_parent}; '
+                    f'while [ "$_p" != {q_gw_anc} ] && [ "$_p" != "/" ]; do '
+                    '  [ -d "$_p" ] && chmod g+rwx "$_p" 2>/dev/null || true; '
+                    '  _p=$(dirname "$_p"); '
+                    'done'
+                )
+                self._exec(chmod_dirs_cmd)
 
         # Write atomically: stream into a temp file in the SAME directory,
         # then ``mv`` it over the target. The rename is atomic on POSIX
@@ -1498,6 +1536,23 @@ class ShellFileOperations(FileOperations):
 
         if write_result.exit_code != 0:
             return WriteResult(error=f"Failed to write file: {write_result.stdout}")
+
+        # ── File group-writability inheritance ──────────────────────────
+        # If the parent directory is group-writable, make the file
+        # group-writable too.  This keeps files in shared workspaces
+        # accessible by all group members without manual chmod.
+        # Best-effort: failures are silently ignored.
+        if parent:
+            q_parent = self._escape_shell_arg(parent)
+            q_path = self._escape_shell_arg(path)
+            self._exec(
+                f"if [ -d {q_parent} ]; then "
+                f"  _m=$(stat -c%a {q_parent} 2>/dev/null || stat -f%Lp {q_parent} 2>/dev/null || echo 0); "
+                f"  if [ -n \"$_m\" ] && [ $((0$_m & 0020)) -ne 0 ]; then "
+                f"  chmod g+rw {q_path} 2>/dev/null || true; "
+                f"  fi; "
+                f"fi"
+            )
 
         # Get bytes written (wc -c is POSIX, works on Linux + macOS)
         stat_cmd = f"wc -c < {self._escape_shell_arg(path)} 2>/dev/null"

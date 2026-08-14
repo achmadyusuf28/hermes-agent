@@ -1507,6 +1507,13 @@ def init_agent(
     else:
         agent._prompt_overrides = {}
 
+    # Verbosity personality trait (0.0–1.0, from top-level personality section)
+    _personality_cfg = _agent_cfg.get("personality", {})
+    if isinstance(_personality_cfg, dict):
+        agent._verbosity = float(_personality_cfg.get("verbosity", 0.5))
+    else:
+        agent._verbosity = 0.5
+
     # Initialize context compressor for automatic context management
     # Compresses conversation when approaching model's context limit
     # Configuration via config.yaml (compression section)

@@ -192,6 +192,14 @@ class ChatCompletionsTransport(ProviderTransport):
                     break
 
         if not needs_sanitize:
+            # Even when no sanitization was triggered, drop non-dict
+            # elements (e.g. strings) that would cause Rust-based API
+            # servers (opencode-go) to reject the payload with
+            # "expected struct RequestMessageToolCall".
+            if any(not isinstance(m, dict) for m in messages):
+                sanitized = list(messages)
+                sanitized = [m for m in sanitized if isinstance(m, dict)]
+                return sanitized
             return messages
 
         sanitized = list(messages)
@@ -251,6 +259,9 @@ class ChatCompletionsTransport(ProviderTransport):
                             copied_tool_calls[tc_idx] = copied_tc
                 if copied_tool_calls is not None:
                     mutable_msg()["tool_calls"] = copied_tool_calls
+        # Final safety net: strip any non-dict elements that could leak
+        # into the payload and cause Rust-based API deserialization errors.
+        sanitized = [m for m in sanitized if isinstance(m, dict)]
         return sanitized
 
     def convert_tools(self, tools: list[dict[str, Any]]) -> list[dict[str, Any]]:

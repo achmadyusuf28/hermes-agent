@@ -898,6 +898,176 @@ class TestDelegateObservability(unittest.TestCase):
             result = json.loads(delegate_task(goal="Test empty sentinel", parent_agent=parent))
             self.assertEqual(result["results"][0]["status"], "failed")
 
+    # ── Touch 0: enriched tool_trace (args + output_head) ─────────────
+    def test_touch0_captures_args_and_output_head(self):
+        """Evidence-bearing tools get `args` (parsed, redacted) + `output_head`."""
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.model = "claude-sonnet-4-6"
+            mock_child.session_prompt_tokens = 5000
+            mock_child.session_completion_tokens = 1200
+            mock_child.run_conversation.return_value = {
+                "final_response": "done",
+                "completed": True,
+                "interrupted": False,
+                "api_calls": 1,
+                "messages": [
+                    {"role": "assistant", "tool_calls": [
+                        {"id": "tc_1", "function": {"name": "search_files",
+                                                    "arguments": '{"pattern": "TODO", "path": "/src/main"}'}}
+                    ]},
+                    {"role": "tool", "tool_call_id": "tc_1",
+                     "content": "/src/main/Worker.java:42: // TODO: fix this"},
+                    {"role": "assistant", "content": "done"},
+                ],
+            }
+            MockAgent.return_value = mock_child
+
+            result = json.loads(delegate_task(goal="Test touch0", parent_agent=parent))
+            trace = result["results"][0]["tool_trace"]
+            self.assertEqual(len(trace), 1)
+            entry = trace[0]
+            self.assertEqual(entry["tool"], "search_files")
+            self.assertEqual(entry["args"]["pattern"], "TODO")
+            self.assertEqual(entry["args"]["path"], "/src/main")
+            self.assertIn("TODO: fix this", entry["output_head"])
+            self.assertEqual(entry["status"], "ok")
+
+    def test_touch0_skips_output_head_for_non_evidence_tool(self):
+        """Media/binary tools produce no output_head yet still carry args."""
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.model = "claude-sonnet-4-6"
+            mock_child.session_prompt_tokens = 0
+            mock_child.session_completion_tokens = 0
+            mock_child.run_conversation.return_value = {
+                "final_response": "done",
+                "completed": True,
+                "interrupted": False,
+                "api_calls": 1,
+                "messages": [
+                    {"role": "assistant", "tool_calls": [
+                        {"id": "tc_1", "function": {"name": "image_generate",
+                                                    "arguments": '{"prompt": "a cat"}'}}
+                    ]},
+                    {"role": "tool", "tool_call_id": "tc_1",
+                     "content": '{"url": "http://x/img.png"}'},
+                    {"role": "assistant", "content": "done"},
+                ],
+            }
+            MockAgent.return_value = mock_child
+
+            result = json.loads(delegate_task(goal="Test skip", parent_agent=parent))
+            entry = result["results"][0]["tool_trace"][0]
+            self.assertEqual(entry["tool"], "image_generate")
+            self.assertNotIn("output_head", entry)
+            self.assertEqual(entry["args"]["prompt"], "a cat")
+
+    def test_touch0_output_head_bounded(self):
+        """output_head never exceeds _OUTPUT_HEAD_MAX chars."""
+        from tools.delegate_tool import _OUTPUT_HEAD_MAX
+
+        parent = _make_mock_parent(depth=0)
+        big = "L" * 5000
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.model = "claude-sonnet-4-6"
+            mock_child.session_prompt_tokens = 0
+            mock_child.session_completion_tokens = 0
+            mock_child.run_conversation.return_value = {
+                "final_response": "done",
+                "completed": True,
+                "interrupted": False,
+                "api_calls": 1,
+                "messages": [
+                    {"role": "assistant", "tool_calls": [
+                        {"id": "tc_1", "function": {"name": "terminal",
+                                                    "arguments": '{"command": "cat big"}'}}
+                    ]},
+                    {"role": "tool", "tool_call_id": "tc_1", "content": big},
+                    {"role": "assistant", "content": "done"},
+                ],
+            }
+            MockAgent.return_value = mock_child
+
+            result = json.loads(delegate_task(goal="Test bound", parent_agent=parent))
+            entry = result["results"][0]["tool_trace"][0]
+            self.assertIn("output_head", entry)
+            self.assertLessEqual(len(entry["output_head"]), _OUTPUT_HEAD_MAX)
+
+    def test_touch0_redacts_secrets_in_args_and_output(self):
+        """API keys / tokens in tool args or results are masked before capture."""
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.model = "claude-sonnet-4-6"
+            mock_child.session_prompt_tokens = 0
+            mock_child.session_completion_tokens = 0
+            mock_child.run_conversation.return_value = {
+                "final_response": "done",
+                "completed": True,
+                "interrupted": False,
+                "api_calls": 1,
+                "messages": [
+                    {"role": "assistant", "tool_calls": [
+                        {"id": "tc_1", "function": {"name": "web_extract",
+                                                    "arguments": '{"url": "https://x", "api_key": "sk-AbCdEf1234567890xyzw"}'}}
+                    ]},
+                    {"role": "tool", "tool_call_id": "tc_1",
+                     "content": "RESULT token=sk-AbCdEf1234567890xyzw secret; ok"},
+                    {"role": "assistant", "content": "done"},
+                ],
+            }
+            MockAgent.return_value = mock_child
+
+            result = json.loads(delegate_task(goal="Test redact", parent_agent=parent))
+            entry = result["results"][0]["tool_trace"][0]
+            # args: the sk- value must not appear verbatim; it's masked
+            args_json = json.dumps(entry["args"])
+            self.assertNotIn("sk-AbCdEf1234567890xyzw", args_json)
+            self.assertTrue(
+                "***" in args_json or "redacted" in args_json.lower()
+            )
+            # output_head: recognized-prefix token masked even mid-string
+            self.assertNotIn("sk-AbCdEf1234567890xyzw", entry["output_head"])
+
+    def test_touch0_parallel_calls_keyed_correctly(self):
+        """Parallel evidence-tool results pair with the right entry via tool_call_id."""
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.model = "claude-sonnet-4-6"
+            mock_child.session_prompt_tokens = 3000
+            mock_child.session_completion_tokens = 800
+            mock_child.run_conversation.return_value = {
+                "final_response": "done",
+                "completed": True,
+                "interrupted": False,
+                "api_calls": 1,
+                "messages": [
+                    {"role": "assistant", "tool_calls": [
+                        {"id": "tc_a", "function": {"name": "web_search", "arguments": '{"query": "a"}'}},
+                        {"id": "tc_b", "function": {"name": "terminal", "arguments": '{"command": "ls"}'}},
+                    ]},
+                    {"role": "tool", "tool_call_id": "tc_a", "content": "RESULT-A result"},
+                    {"role": "tool", "tool_call_id": "tc_b", "content": "file1.txt"},
+                    {"role": "assistant", "content": "done"},
+                ],
+            }
+            MockAgent.return_value = mock_child
+
+            result = json.loads(delegate_task(goal="Test parallel key", parent_agent=parent))
+            trace = result["results"][0]["tool_trace"]
+            self.assertIn("RESULT-A result", trace[0]["output_head"])
+            self.assertIn("file1.txt", trace[1]["output_head"])
+
 
 class TestSubagentCostRollup(unittest.TestCase):
     """Port of Kilo-Org/kilocode#9448 — parent's session_estimated_cost_usd

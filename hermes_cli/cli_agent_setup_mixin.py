@@ -591,8 +591,13 @@ class CLIAgentSetupMixin:
                     # Extract tool names
                     names = []
                     for tc in tool_calls:
-                        fn = tc.get("function", {})
-                        name = fn.get("name", "unknown") if isinstance(fn, dict) else "unknown"
+                        if isinstance(tc, dict):
+                            fn = tc.get("function", {})
+                            name = fn.get("name", "unknown") if isinstance(fn, dict) else "unknown"
+                        elif isinstance(tc, str):
+                            name = tc
+                        else:
+                            name = "unknown"
                         if name not in names:
                             names.append(name)
                     names_str = ", ".join(names[:4])

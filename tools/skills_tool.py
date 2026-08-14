@@ -716,6 +716,26 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
 
     skills = []
     seen_names: set = set()
+    # Names claimed by a Nix skill that declares a `twin` (the markdown skill it
+    # replaces). Such markdown twins are shadowed at discovery so the Nix module
+    # wins the name — improvements land in Nix, the .md stays on disk as the
+    # fallback/source until the migration is proven, then it's inert.
+    claimed_by_twin: set = set()
+
+    # Pre-scan Nix modules once for twin claims so the markdown loop below can
+    # skip shadowed twins regardless of scan order.
+    twin_dir = get_nix_skills_dir()
+    if twin_dir.exists():
+        try:
+            for nix_path in _iter_nix_skill_files(twin_dir):
+                try:
+                    nm = _parse_nix_skill(nix_path)
+                except Exception:
+                    nm = None
+                if nm is not None and nm.get("twin"):
+                    claimed_by_twin.add(nm["twin"][:MAX_NAME_LENGTH])
+        except Exception:
+            pass
 
     # Scan local dir first, then external dirs (local takes precedence) —
     # dirs_to_scan already resolved above for the signature.
@@ -738,6 +758,11 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
 
                 name = frontmatter.get("name", skill_dir.name)[:MAX_NAME_LENGTH]
                 if name in seen_names:
+                    continue
+                if name in claimed_by_twin:
+                    # A Nix skill declares this as its twin — the Nix module
+                    # owns the name. Keep the .md on disk (fallback/source) but
+                    # don't serve it alongside the twin.
                     continue
                 if name in disabled:
                     continue
@@ -807,6 +832,7 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
                     "description": description,
                     "category": category,
                     "source": "nix",
+                    "twin": nix_meta.get("twin", ""),
                 })
             except Exception as e:
                 logger.debug(
@@ -1251,6 +1277,33 @@ def skill_view(
         if candidates:
             skill_dir, skill_md = candidates[0]
 
+        # Twin redirect: if a Nix module claims this skill name (a module named
+        # <name>.nix, or any module whose `twin` == name), prefer the Nix module
+        # over the markdown twin — discovery shadows the twin, so the load path
+        # must agree. Keeps "improvements land in Nix" true end-to-end.
+        if skill_md is not None:
+            try:
+                nix_dir = get_nix_skills_dir()
+                if nix_dir.exists():
+                    nix_claim = nix_dir / f"{name}.nix"
+                    if not (nix_claim.exists()):
+                        # fall back to any module whose twin == this name
+                        nix_claim = None
+                        for nxp in _iter_nix_skill_files(nix_dir):
+                            try:
+                                nmx = _parse_nix_skill(nxp)
+                            except Exception:
+                                nmx = None
+                            if nmx is not None and nmx.get("twin") == name:
+                                nix_claim = nxp
+                                break
+                    if nix_claim is not None and nix_claim.exists():
+                        # Redirect to the Nix module; the block at 1280+ serves it.
+                        skill_dir = None
+                        skill_md = None
+            except Exception:
+                pass
+
         if not skill_md or not skill_md.exists():
             # Fallback: try Nix skill module
             nix_dir = get_nix_skills_dir()
@@ -1285,6 +1338,38 @@ def skill_view(
                         parts.append(f"\n**Category:** {nix_meta.get('category') or 'uncategorized'}")
                         parts.append(f"**Type:** {nix_meta.get('type', 'knowledge')}")
                         parts.append(f"**Source:** Nix module (`{nix_skill_path}`)")
+
+                        # Provenance note: migrated-from-markdown tracking. Lets us
+                        # grep which Nix skills came from a .md twin vs native.
+                        # Sparse bodies defer full field-filling until first use —
+                        # the original markdown remains the source for unfinished
+                        # fields until this skill is promoted to stable.
+                        twin_name = nix_meta.get("twin", "")
+                        skill_status = nix_meta.get("status", "stable")
+                        if twin_name and skill_status == "migrated":
+                            # REVIEW-BEFORE-USE gate: conversion is lossy (references/,
+                            # env/platform gating, extended metadata may not have carried
+                            # over). The Nix module is NON-authoritative: SELF should
+                            # cross-check the original md before trusting/using it, and
+                            # only after filling the gaps should a human/adapter flip
+                            # status to "stable".
+                            parts.append(
+                                f"\n> ⚠️ **REVIEW BEFORE USE — status: `migrated`**\n"
+                                f"> This Nix skill is a lossy conversion from markdown twin "
+                                f"`{twin_name}`. The original `.md` may still hold "
+                                f"`references/`, environment/platform gates, or extended "
+                                f"metadata that did NOT carry over. **Treat this Nix "
+                                f"module as non-authoritative** — cross-check the original "
+                                f"markdown before using it.\n"
+                                f"> Flip `status = \"migrated\"` → `\"stable\"` in the module "
+                                f"only after the gaps are filled and it is verified."
+                            )
+                        elif twin_name:
+                            parts.append(
+                                f"\n> **Migrated from markdown** — twin: `{twin_name}`. "
+                                f"The original `.md` stays on disk (shadowed at discovery); "
+                                f"further edits land here in Nix."
+                            )
 
                         if nix_meta.get("triggers"):
                             parts.append(f"\n## Triggers")

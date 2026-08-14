@@ -8040,6 +8040,29 @@ def edit_config():
     subprocess.run([editor, str(config_path)])
 
 
+def get_config_value(key: str, default: Any = None) -> Any:
+    """Read a configuration value by dot-separated key.
+
+    Args:
+        key: Dotted config key, e.g. ``"sessiondb.provider"``.
+        default: Fallback value if key is not found.
+
+    Returns:
+        The config value, or *default* if not set.
+    """
+    config = load_config_readonly()
+    parts = key.split(".")
+    val = config
+    for part in parts:
+        if isinstance(val, dict):
+            val = val.get(part)
+            if val is None:
+                return default
+        else:
+            return default
+    return val
+
+
 def set_config_value(key: str, value: str):
     """Set a configuration value."""
     if is_managed():

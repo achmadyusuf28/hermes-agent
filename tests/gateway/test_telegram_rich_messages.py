@@ -67,6 +67,7 @@ def _make_adapter(extra=None):
     # do_api_request as an AsyncMock makes inspect.iscoroutinefunction(...) True,
     # so _bot_supports_rich() is satisfied (real Bot.do_api_request is async too).
     bot.do_api_request = AsyncMock(return_value=SimpleNamespace(message_id=123))
+    bot.editMessageText = AsyncMock(return_value=SimpleNamespace(message_id=123))
     bot.send_message = AsyncMock(return_value=MagicMock(message_id=1))
     bot.send_chat_action = AsyncMock()  # keeps the post-send typing re-trigger quiet
     bot.send_message_draft = AsyncMock(return_value=True)  # legacy draft fallback
@@ -828,10 +829,9 @@ async def test_rich_draft_opt_out_uses_legacy():
 
 
 def _rich_edit_kwargs(adapter):
-    """Return the api_kwargs dict from the single editMessageText rich call."""
-    call = adapter._bot.do_api_request.call_args
-    assert call.args[0] == "editMessageText"
-    return call.kwargs["api_kwargs"]
+    """Return the kwargs dict from the single editMessageText rich call."""
+    call = adapter._bot.editMessageText.call_args
+    return call.kwargs
 
 
 @pytest.mark.asyncio
@@ -915,7 +915,7 @@ async def test_finalize_edit_rich_capability_error_falls_back_to_legacy():
     """A capability error on the rich edit latches rich off and falls back to
     the legacy MarkdownV2 edit so the user still gets the final answer."""
     adapter = _make_adapter()
-    adapter._bot.do_api_request = AsyncMock(side_effect=PTB_ENDPOINT_NOT_FOUND)
+    adapter._bot.editMessageText = AsyncMock(side_effect=PTB_ENDPOINT_NOT_FOUND)
 
     result = await adapter.edit_message(
         "12345", "555", RICH_CONTENT, finalize=True,
@@ -931,7 +931,7 @@ async def test_finalize_edit_rich_not_modified_is_success_noop():
     """'Message is not modified' on a rich edit is a no-op success — must NOT
     fall through to a redundant legacy edit."""
     adapter = _make_adapter()
-    adapter._bot.do_api_request = AsyncMock(
+    adapter._bot.editMessageText = AsyncMock(
         side_effect=BadRequest("Message is not modified")
     )
 

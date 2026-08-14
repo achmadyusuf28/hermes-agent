@@ -1103,6 +1103,8 @@ def _collect_auto_append_media_tags(
         if msg.get("role") != "assistant":
             continue
         for call in msg.get("tool_calls") or []:
+            if not isinstance(call, dict):
+                continue
             call_id = call.get("id") or call.get("call_id")
             fn = call.get("function") or {}
             name = str(fn.get("name") or call.get("name") or "")
@@ -1167,6 +1169,8 @@ def _collect_history_media_paths(agent_history: List[Dict[str, Any]]) -> set:
     for msg in agent_history:
         if msg.get("role") == "assistant":
             for call in msg.get("tool_calls") or []:
+                if not isinstance(call, dict):
+                    continue
                 cid = call.get("id") or call.get("call_id")
                 fn = call.get("function") or {}
                 name = str(fn.get("name") or call.get("name") or "")

@@ -37,6 +37,7 @@ import logging
 import os
 import re
 import shutil
+import stat
 import tempfile
 import contextvars as _ctxvars
 from pathlib import Path
@@ -778,8 +779,14 @@ def _md_to_nix_skill(name: str, content: str, category: str = None) -> str:
     # P1 fields
     check = fm.get("check")
     if check:
-        check_str = str(check).replace('"', '\\"')
-        fields.append(f'  check = "{check_str}";')
+        # Emit check as a Nix multiline string (''...'') so the same field is
+        # readable by both the skill pipeline (parse_nix_skill) and the
+        # autonomic loop's flat regexes — which require the ''\n form.
+        # NOTE: check bodies are regex-extracted and run via /bin/sh, never
+        # Nix-evaluated — so keep ${...} LITERAL (do NOT escape to ''${ ,
+        # which would corrupt shell execution).
+        check_body = str(check).strip("\n")
+        fields.append(f"  check = ''\n{check_body}\n'';")
     check_interval = fm.get("check_interval")
     if check_interval and str(check_interval) != "5m":
         fields.append(f'  check_interval = "{check_interval}";')
@@ -794,6 +801,13 @@ def _md_to_nix_skill(name: str, content: str, category: str = None) -> str:
     if version != 1:
         fields.append(f"  version = {version};")
     status = fm.get("status", "stable")
+    # Auto-mark a md→Nix conversion as "migrated" (non-authoritative) unless the
+    # source explicitly declares a status. This makes the label meaningful from
+    # day one: a freshly converted twin renders with the REVIEW-BEFORE-USE gate
+    # until a human/adapter flips it to "stable". ONLY "stable" is authoritative.
+    twin = fm.get("twin", "")
+    if status == "stable" and twin:
+        status = "migrated"
     if status != "stable":
         fields.append(f'  status = "{status}";')
     changelog = fm.get("changelog", [])
@@ -815,6 +829,59 @@ def _md_to_nix_skill(name: str, content: str, category: str = None) -> str:
     if author:
         author_esc = str(author).replace('"', '\\"')
         fields.append(f'  author = "{author_esc}";')
+
+    # Twin = name of the markdown skill this Nix module replaces (side-by-side
+    # migration provenance). Round-trips so an edited/saved Nix skill keeps the
+    # pointer to its .md twin, letting discovery shadow the twin and rendering
+    # show the migrated-from note.
+    twin = fm.get("twin", "")
+    if twin:
+        twin_esc = str(twin).replace('"', '\\"')
+        fields.append(f'  twin = "{twin_esc}";')
+
+    # ── Gap-6 carriage: platforms / environments / references / metadata.hermes ──
+    # Preserve markdown frontmatter through conversion so nothing is dropped.
+    # These are CARRIED (not gated on here — gating parity is gap 3, separate).
+    platforms = fm.get("platforms", [])
+    if isinstance(platforms, str):
+        platforms = [platforms]
+    if platforms:
+        fields.append(f"  platforms = {_nix_list_str(list(platforms))};")
+
+    environments = fm.get("environments", [])
+    if isinstance(environments, str):
+        environments = [environments]
+    if environments:
+        fields.append(f"  environments = {_nix_list_str(list(environments))};")
+
+    references = fm.get("references", [])
+    if isinstance(references, str):
+        references = [references]
+    if references:
+        fields.append(f"  references = {_nix_list_str(list(references))};")
+
+    # Nested metadata (e.g. `metadata: { hermes: { tags: [...]; related_skills: [...] } }`)
+    metadata = fm.get("metadata", {})
+    if isinstance(metadata, dict) and metadata:
+        meta_parts = []
+        for mk, mv in metadata.items():
+            if isinstance(mv, dict):
+                sub_parts = []
+                for sk, sv in mv.items():
+                    if isinstance(sv, (list, tuple)):
+                        sub_parts.append(f"{sk} = {_nix_list_str([str(x) for x in sv])};")
+                    elif sv is not None:
+                        sub_parts.append(
+                            f'{sk} = "{str(sv).replace(chr(34), chr(92) + chr(34))}";'
+                        )
+                if sub_parts:
+                    meta_parts.append(
+                        f"    {mk} = {{\n" + "\n".join(sub_parts) + "\n    };"
+                    )
+            elif mv is not None:
+                meta_parts.append(f'    {mk} = "{str(mv).replace(chr(34), chr(92) + chr(34))}";')
+        if meta_parts:
+            fields.append("  metadata = {\n" + "\n".join(meta_parts) + "\n  };")
 
     # Check for verify section
     verify_items = _extract_section_items(body, "Verification Checklist", "Verification")
@@ -1085,11 +1152,50 @@ def _resolve_skill_target(skill_dir: Path, file_path: str) -> Tuple[Optional[Pat
     """Resolve a supporting-file path and ensure it stays within the skill directory."""
     from tools.path_security import validate_within_dir
 
+    # For .nix skills (single-file format), derive the target directory
+    # from the stem so sub-files like references/ work correctly.
+    if skill_dir.is_file() and skill_dir.suffix == ".nix":
+        skill_dir = skill_dir.parent / skill_dir.stem
+
     target = skill_dir / file_path
-    error = validate_within_dir(target, skill_dir)
+    if skill_dir.is_file():
+        # Defensive: should already be resolved above, but guard against
+        # any other single-file skill format reaching this far.
+        error = validate_within_dir(target, skill_dir.parent)
+    else:
+        error = validate_within_dir(target, skill_dir)
     if error:
         return None, error
     return target, None
+
+
+def _propagate_group_write(file_path: Path) -> None:
+    """Propagate group-writability through new dirs and the target file.
+
+    Walk up from the file's parent directory looking for the nearest
+    ancestor with the group-write bit set.  If found, walk back down
+    and ``chmod g+rwx`` any directories between that ancestor and the
+    file, then ``chmod g+rw`` the file itself.
+    Best-effort: failures are silently ignored.
+    """
+    try:
+        # Walk up from the parent to find the nearest group-writable ancestor.
+        anc = file_path.parent
+        while anc != anc.parent:  # stop at root
+            if anc.is_dir() and (anc.stat().st_mode & stat.S_IWGRP):
+                break
+            anc = anc.parent
+        if not anc.is_dir() or not (anc.stat().st_mode & stat.S_IWGRP):
+            return
+        # Walk back down: chmod new dirs, then the file.
+        d = file_path.parent
+        while d != anc:
+            if d.is_dir():
+                d.chmod(d.stat().st_mode | stat.S_IWGRP | stat.S_IXGRP | stat.S_IRGRP)
+            d = d.parent
+        file_path.chmod(file_path.stat().st_mode | stat.S_IWGRP | stat.S_IRGRP)
+    except OSError:
+        pass
 
 
 def _atomic_write_text(file_path: Path, content: str, encoding: str = "utf-8") -> None:
@@ -1115,6 +1221,9 @@ def _atomic_write_text(file_path: Path, content: str, encoding: str = "utf-8") -
         with os.fdopen(fd, "w", encoding=encoding) as f:
             f.write(content)
         atomic_replace(temp_path, file_path)
+        # Propagate group-writability: if the parent dir is group-writable,
+        # make the file (and any newly created parent dirs) group-writable too.
+        _propagate_group_write(file_path)
     except Exception:
         # Clean up temp file on error
         try:

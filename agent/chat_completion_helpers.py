@@ -1006,6 +1006,16 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
         from agent.redact import redact_sensitive_text
         _san_content = redact_sensitive_text(_san_content)
 
+    # When tool_calls are present, content must be a string (or empty).
+    # List-type content (multimodal responses) alongside tool_calls is not
+    # valid for strict OpenAI-compatible APIs and causes deserialization
+    # errors ("expected struct RequestMessageToolCall").
+    if assistant_tool_calls and not isinstance(_san_content, str):
+        if isinstance(_san_content, list) and _san_content and isinstance(_san_content[0], dict):
+            _san_content = _sanitize_surrogates(_san_content[0].get("text", "") or "")
+        else:
+            _san_content = ""
+
     msg = {
         "role": "assistant",
         "content": _san_content,

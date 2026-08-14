@@ -4078,6 +4078,27 @@ class SQLiteSessionDB(SessionDBProvider):
         return self._execute_write(_do)
 
 
+    @staticmethod
+    def _normalize_tool_calls(tc_json: str) -> list:
+        """Deserialize tool_calls JSON and coerce every element to an OpenAI-format dict.
+
+        Legacy sessions can store raw strings (tool names) or other non-dict items
+        as tool_calls.  Normalize at the deserialisation boundary so downstream
+        iteration always sees dicts with ``id``, ``type``, and ``function`` keys.
+        """
+        try:
+            tc_list = json.loads(tc_json)
+        except (json.JSONDecodeError, TypeError):
+            return []
+        if not isinstance(tc_list, list):
+            return []
+        return [
+            tc if isinstance(tc, dict)
+            else {"id": str(tc), "type": "function",
+                  "function": {"name": str(tc), "arguments": "{}"}}
+            for tc in tc_list
+        ]
+
     def get_messages(
         self,
         session_id: str,
@@ -4120,11 +4141,7 @@ class SQLiteSessionDB(SessionDBProvider):
             if "content" in msg:
                 msg["content"] = self._decode_content(msg["content"])
             if msg.get("tool_calls"):
-                try:
-                    msg["tool_calls"] = json.loads(msg["tool_calls"])
-                except (json.JSONDecodeError, TypeError):
-                    logger.warning("Failed to deserialize tool_calls in get_messages, falling back to []")
-                    msg["tool_calls"] = []
+                msg["tool_calls"] = self._normalize_tool_calls(msg["tool_calls"])
             result.append(msg)
         return result
 
@@ -4187,13 +4204,7 @@ class SQLiteSessionDB(SessionDBProvider):
             if "content" in msg:
                 msg["content"] = self._decode_content(msg["content"])
             if msg.get("tool_calls"):
-                try:
-                    msg["tool_calls"] = json.loads(msg["tool_calls"])
-                except (json.JSONDecodeError, TypeError):
-                    logger.warning(
-                        "Failed to deserialize tool_calls in get_messages_around, falling back to []"
-                    )
-                    msg["tool_calls"] = []
+                msg["tool_calls"] = self._normalize_tool_calls(msg["tool_calls"])
             result.append(msg)
 
         # before_rows includes the anchor itself; subtract 1 for the count of
@@ -4309,13 +4320,7 @@ class SQLiteSessionDB(SessionDBProvider):
             if "content" in msg:
                 msg["content"] = self._decode_content(msg["content"])
             if msg.get("tool_calls"):
-                try:
-                    msg["tool_calls"] = json.loads(msg["tool_calls"])
-                except (json.JSONDecodeError, TypeError):
-                    logger.warning(
-                        "Failed to deserialize tool_calls in get_anchored_view, falling back to []"
-                    )
-                    msg["tool_calls"] = []
+                msg["tool_calls"] = self._normalize_tool_calls(msg["tool_calls"])
             return msg
 
         return {
@@ -4466,11 +4471,7 @@ class SQLiteSessionDB(SessionDBProvider):
             if row["tool_name"]:
                 msg["tool_name"] = row["tool_name"]
             if row["tool_calls"]:
-                try:
-                    msg["tool_calls"] = json.loads(row["tool_calls"])
-                except (json.JSONDecodeError, TypeError):
-                    logger.warning("Failed to deserialize tool_calls in conversation replay, falling back to []")
-                    msg["tool_calls"] = []
+                msg["tool_calls"] = self._normalize_tool_calls(row["tool_calls"])
             # Surface the platform-side message id (e.g. yuanbao msg_id,
             # telegram update_id) so platform-specific flows like recall
             # can match by external identifier instead of having to fall
