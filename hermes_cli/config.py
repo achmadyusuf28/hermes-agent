@@ -973,6 +973,14 @@ DEFAULT_CONFIG = {
     # sessions (no live client) so accumulated agents don't pile up under memory
     # pressure. Reopening one re-resumes it from disk. 0/null disables.
     "max_live_sessions": 16,
+    # Session storage backend. provider: "postgresql" (default) or "sqlite".
+    # dsn is only used by the PostgreSQL backend. NOTE: the resolver treats
+    # an unset provider as "postgresql", so leave DSN here if you run PG.
+    "sessiondb": {
+        "provider": "postgresql",
+        "dsn": "postgresql://hermes@localhost/hermes_sessions",
+    },
+
     "agent": {
         "max_turns": 90,
         # Inactivity timeout for gateway agent execution (seconds).
